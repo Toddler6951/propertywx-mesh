@@ -29,4 +29,4 @@ EXPOSE 8000
 
 # Use gunicorn for production (multi-worker, robust). 2 workers, 4 threads each
 # is a fine default for a small service that's mostly I/O-bound on GRIB downloads.
-CMD gunicorn --bind 0.0.0.0:${PORT} --workers 2 --threads 4 --timeout 120 app:app
+CMD gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 2 --threads 4 --timeout 120 app:app

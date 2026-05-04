@@ -42,8 +42,14 @@ from flask_cors import CORS
 
 try:
     import eccodes
-except ImportError:
-    eccodes = None  # Lets the container come up even if libeccodes is missing — health check exposes the issue.
+except Exception as _ecc_err:  # noqa: BLE001
+    # Catch broadly — eccodes can raise RuntimeError/OSError when the C library
+    # can't be located or has an ABI mismatch. We let the container come up
+    # regardless so /health stays reachable; the response advertises the failure.
+    eccodes = None
+    _ECCODES_IMPORT_ERROR = repr(_ecc_err)
+else:
+    _ECCODES_IMPORT_ERROR = None
 
 # -----------------------------------------------------------------------------
 # Config
@@ -268,6 +274,7 @@ def health():
     return jsonify({
         "status": "ok",
         "eccodes": eccodes is not None,
+        "eccodes_error": _ECCODES_IMPORT_ERROR,
         "cache_db": os.path.exists(DB_PATH),
         "version": eccodes.codes_get_api_version() if eccodes else None,
     })
@@ -284,7 +291,12 @@ def root():
     })
 
 
-cleanup_old_grib_files()
+try:
+    cleanup_old_grib_files()
+except Exception as _cleanup_err:  # noqa: BLE001
+    # Don't let a transient FS issue (volume not yet mounted, perms, etc.)
+    # prevent the container from booting.
+    LOG.warning(f"cleanup_old_grib_files skipped: {_cleanup_err!r}")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=False)
