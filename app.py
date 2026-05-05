@@ -856,9 +856,16 @@ def probe():
 # NEXRAD Level 2 — radar verification (Phase D)
 # -----------------------------------------------------------------------------
 def nexrad_list_volumes(radar_id, date):
-    """Enumerate NEXRAD Level 2 volume keys in noaa-nexrad-level2 for a
-    radar+date. Bucket layout:
-        s3://noaa-nexrad-level2/<YYYY>/<MM>/<DD>/<RID>/<RID><YYYYMMDD>_<HHMMSS>_V06[.gz]
+    """Enumerate NEXRAD Level 2 volume keys for a radar+date.
+
+    We use Unidata's public mirror (unidata-nexrad-level2) rather than NOAA's
+    canonical bucket (noaa-nexrad-level2). Both contain the same data and
+    follow identical key conventions, but only Unidata's bucket policy allows
+    anonymous ListObjects — NOAA's blocks listing for unauthenticated callers
+    even though individual GETs are public.
+
+    Bucket layout:
+        s3://unidata-nexrad-level2/<YYYY>/<MM>/<DD>/<RID>/<RID><YYYYMMDD>_<HHMMSS>_V06[.gz]
 
     Returns list of (hhmmss, full_url) sorted ascending. Filters out the
     "MDM" (metadata-only) and tar-archive sentinel files some radars emit.
@@ -868,7 +875,7 @@ def nexrad_list_volumes(radar_id, date):
     dd = date.strftime("%d")
     prefix = f"{yyyy}/{mm}/{dd}/{radar_id}/"
     list_url = (
-        f"https://noaa-nexrad-level2.s3.amazonaws.com/"
+        f"https://unidata-nexrad-level2.s3.amazonaws.com/"
         f"?list-type=2&prefix={prefix}&max-keys=1000"
     )
     try:
@@ -886,7 +893,7 @@ def nexrad_list_volumes(radar_id, date):
             m = re.search(r"_(\d{6})_V0[5-6]", k)
             if not m:
                 continue
-            results.append((m.group(1), f"https://noaa-nexrad-level2.s3.amazonaws.com/{k}"))
+            results.append((m.group(1), f"https://unidata-nexrad-level2.s3.amazonaws.com/{k}"))
         results.sort()
         return results
     except requests.RequestException as e:
