@@ -14,7 +14,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py .
+# Copy all Python source. Glob picks up app.py + any helper modules
+# (wsr88d_sites.py, etc.) without needing to update this list each time.
+COPY *.py ./
 
 # Persistent volume mount point (Railway: configure a Volume on /data).
 RUN mkdir -p /data /data/grib_cache
