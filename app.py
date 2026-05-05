@@ -1028,6 +1028,77 @@ def parse_nexrad_volume(url, radar_id, hhmmss, date, prop_lat, prop_lon,
     }
 
 
+def render_radar_png(local_path, prop_lat, prop_lon, radar_lat, radar_lon,
+                     range_mi=30, peak_label=None):
+    """Render a forensic PNG of the lowest-elev reflectivity sweep with the
+    property pin overlaid. Cropped to ~range_mi around the property so the
+    storm structure is visible rather than the radar's full ~250 km reach.
+
+    Returns a base64-encoded PNG string, or None on error. Uses matplotlib's
+    Agg backend so no display server is required on Railway.
+    """
+    if pyart is None or np is None:
+        return None
+    try:
+        import base64
+        import io
+        from math import cos, radians, sin
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        radar = pyart.io.read_nexrad_archive(local_path, include_fields=["reflectivity"])
+        elev_angles = radar.fixed_angle["data"]
+        sweep_idx = int(np.argmin(np.abs(elev_angles - 0.5)))
+
+        fig, ax = plt.subplots(figsize=(8, 8), dpi=100)
+        display = pyart.graph.RadarDisplay(radar)
+        display.plot_ppi(
+            "reflectivity", sweep=sweep_idx,
+            cmap="pyart_NWSRef", vmin=-20, vmax=80,
+            colorbar_label="Reflectivity (dBZ)",
+            ax=ax, title_flag=False,
+        )
+
+        # Compute property's (x, y) offset from radar in km — pyart's PPI
+        # plots use east/north from the radar as (x, y).
+        range_km, az_deg = _bearing_range_km(radar_lat, radar_lon, prop_lat, prop_lon)
+        az_rad = radians(az_deg)
+        x_km = range_km * sin(az_rad)
+        y_km = range_km * cos(az_rad)
+
+        ax.plot(x_km, y_km, marker="*", color="yellow", markersize=24,
+                markeredgecolor="black", markeredgewidth=2, linestyle="None", zorder=10)
+        ax.annotate(
+            "Property", (x_km, y_km),
+            textcoords="offset points", xytext=(14, 10),
+            fontsize=11, fontweight="bold", color="black",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="black", alpha=0.9),
+            zorder=11,
+        )
+
+        crop_km = range_mi * 1.609344
+        ax.set_xlim(x_km - crop_km, x_km + crop_km)
+        ax.set_ylim(y_km - crop_km, y_km + crop_km)
+        ax.set_aspect("equal")
+        title_radar = radar.metadata.get("instrument_name", "")
+        title_elev = float(elev_angles[sweep_idx])
+        title = f"{title_radar} reflectivity @ {title_elev:.1f}°"
+        if peak_label:
+            title += f"  ·  {peak_label}"
+        ax.set_title(title, fontsize=11)
+
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("ascii")
+    except Exception as e:  # noqa: BLE001
+        LOG.exception(f"render_radar_png failed: {e}")
+        return None
+
+
 def classify_hail_signature(z, zdr, cc, kdp, beam_height_ft):
     """Rule-based hail classification from dual-pol values at the forensic
     gate. Returns (hsda_class, hca_class, narrative).
@@ -1302,6 +1373,20 @@ def nexrad_verify():
                     peak.get("Z"), peak.get("ZDR"), peak.get("CC"), peak.get("KDP"),
                     beam_height_ft,
                 )
+                # Render the peak volume's lowest-elev reflectivity as a PNG,
+                # cropped to ~30 mi around the property and pinned. Re-loads
+                # the cached volume from disk; only one render per analysis.
+                peak_path = os.path.join(
+                    NEXRAD_CACHE_DIR,
+                    f"{rid}{date.strftime('%Y%m%d')}_{peak['volume_ts']}_V06",
+                )
+                image_b64 = None
+                if os.path.exists(peak_path):
+                    image_b64 = render_radar_png(
+                        peak_path, lat, lon, rlat, rlon, range_mi=30,
+                        peak_label=f"{date.isoformat()} {peak['volume_time_utc']} UTC",
+                    )
+
                 findings = {
                     "peak_volume_ts": peak["volume_ts"],
                     "peak_volume_utc": peak["volume_time_utc"],
@@ -1315,6 +1400,8 @@ def nexrad_verify():
                     "hca_class":  hca,
                     "narrative":  narrative,
                     "volumes_analyzed": len(per_volume),
+                    "image_b64": image_b64,
+                    "image_format": "png" if image_b64 else None,
                 }
 
     return jsonify({
