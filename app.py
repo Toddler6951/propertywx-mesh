@@ -55,6 +55,16 @@ except Exception as _ecc_err:  # noqa: BLE001
 else:
     _ECCODES_IMPORT_ERROR = None
 
+try:
+    import numpy as np
+    import pyart
+except Exception as _pyart_err:  # noqa: BLE001
+    pyart = None
+    np = None
+    _PYART_IMPORT_ERROR = repr(_pyart_err)
+else:
+    _PYART_IMPORT_ERROR = None
+
 from wsr88d_sites import nearest_radar, haversine_mi
 
 # -----------------------------------------------------------------------------
@@ -855,6 +865,209 @@ def probe():
 # -----------------------------------------------------------------------------
 # NEXRAD Level 2 — radar verification (Phase D)
 # -----------------------------------------------------------------------------
+NEXRAD_CACHE_DIR = os.environ.get("NEXRAD_CACHE_DIR", "/data/nexrad_cache")
+
+
+def _bearing_range_km(lat1, lon1, lat2, lon2):
+    """Return (range_km, azimuth_deg) from point 1 to point 2.
+
+    Azimuth is great-circle bearing measured clockwise from true north — this
+    matches the WSR-88D azimuth convention so we can directly compare to
+    `radar.azimuth['data']`.
+    """
+    from math import asin, atan2, cos, degrees, radians, sin, sqrt
+    R_km = 6371.0
+    p1, p2 = radians(lat1), radians(lat2)
+    dp = radians(lat2 - lat1)
+    dl = radians(lon2 - lon1)
+    a = sin(dp / 2) ** 2 + cos(p1) * cos(p2) * sin(dl / 2) ** 2
+    range_km = 2 * R_km * asin(sqrt(a))
+    y = sin(dl) * cos(p2)
+    x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl)
+    az = (degrees(atan2(y, x)) + 360.0) % 360.0
+    return range_km, az
+
+
+def parse_nexrad_volume(url, radar_id, hhmmss, date, prop_lat, prop_lon,
+                        radar_lat, radar_lon):
+    """Download one NEXRAD Level 2 volume and extract dual-pol values at the
+    gates surrounding the property. Returns dict with peak metrics or None.
+
+    Strategy:
+        1. Download to disk cache (volumes are reused across queries).
+        2. Open with pyart.io.read_nexrad_archive — only the dual-pol fields.
+        3. Find the lowest elevation sweep (closest to 0.5°).
+        4. Compute property's range + azimuth from the radar.
+        5. Find rays whose azimuth is within ~1.5° of the property bearing
+           (typical WSR-88D beamwidth) and gates whose range is within ~2 km.
+        6. Read Z / ZDR / CC / KDP at those (ray, gate) pairs.
+        7. Pick the gate with peak reflectivity — that's our forensic gate.
+    """
+    if pyart is None or np is None:
+        return None
+
+    yyyymmdd = date.strftime("%Y%m%d")
+    fname = f"{radar_id}{yyyymmdd}_{hhmmss}_V06"
+    local_path = os.path.join(NEXRAD_CACHE_DIR, fname)
+
+    if not os.path.exists(local_path):
+        try:
+            r = requests.get(url, timeout=60, headers=HTTP_HEADERS)
+            if r.status_code != 200 or not r.content:
+                LOG.info(f"NEXRAD volume {fname}: HTTP {r.status_code}")
+                return None
+            content = r.content
+            if url.endswith(".gz"):
+                try:
+                    content = gzip.decompress(content)
+                except OSError:
+                    pass  # Some Unidata files are NOT gzipped despite history
+            os.makedirs(NEXRAD_CACHE_DIR, exist_ok=True)
+            with open(local_path, "wb") as f:
+                f.write(content)
+        except requests.RequestException as e:
+            LOG.info(f"NEXRAD download {fname} failed: {type(e).__name__}: {e}")
+            return None
+
+    try:
+        radar = pyart.io.read_nexrad_archive(
+            local_path,
+            include_fields=[
+                "reflectivity",
+                "differential_reflectivity",
+                "cross_correlation_ratio",
+                "specific_differential_phase",
+            ],
+        )
+    except Exception as e:
+        LOG.info(f"pyart read failed for {fname}: {type(e).__name__}: {e}")
+        return None
+
+    # Lowest elevation sweep — surface hail forensics live in 0.5° tilt
+    elev_angles = radar.fixed_angle["data"]
+    sweep_idx = int(np.argmin(np.abs(elev_angles - 0.5)))
+    sweep_start, sweep_end = radar.get_start_end(sweep_idx)
+    sweep_slc = slice(sweep_start, sweep_end + 1)
+
+    range_km, az_deg = _bearing_range_km(radar_lat, radar_lon, prop_lat, prop_lon)
+
+    # Azimuth band: ±1.5° around property bearing (covers ~3 rays at 1° spacing)
+    sweep_az = radar.azimuth["data"][sweep_slc]
+    az_diff = np.abs(((sweep_az - az_deg + 180.0) % 360.0) - 180.0)
+    az_idx = np.where(az_diff < 1.5)[0]
+    if az_idx.size == 0:
+        return None
+
+    # Range gates within 2 km of the property
+    gate_range_m = radar.range["data"]
+    rng_diff_km = np.abs(gate_range_m / 1000.0 - range_km)
+    rng_idx = np.where(rng_diff_km < 2.0)[0]
+    if rng_idx.size == 0:
+        return None
+
+    field_map = {
+        "Z":   "reflectivity",
+        "ZDR": "differential_reflectivity",
+        "CC":  "cross_correlation_ratio",
+        "KDP": "specific_differential_phase",
+    }
+    extracted = {short: [] for short in field_map}
+
+    for short, full in field_map.items():
+        if full not in radar.fields:
+            continue
+        sweep_data = radar.fields[full]["data"][sweep_slc]
+        for ai in az_idx:
+            for ri in rng_idx:
+                v = sweep_data[ai, ri]
+                if hasattr(v, "mask") and bool(v.mask):
+                    continue
+                try:
+                    extracted[short].append(float(v))
+                except (TypeError, ValueError):
+                    continue
+
+    z_vals = extracted["Z"]
+    if not z_vals:
+        return None
+
+    # The "forensic gate" is the one with peak reflectivity. We don't track
+    # gate identity per-field separately because typically all dual-pol fields
+    # are co-located, so the peak Z gate's stats include peak ZDR/CC/KDP for
+    # that gate. To stay robust, we pick the simple max of each field across
+    # the same gate set — slightly different gates may dominate per field,
+    # but that's still defensible since "peak across nearby gates" is what
+    # matters for forensic conclusions.
+    def _peak_or_none(vals, op="max"):
+        if not vals:
+            return None
+        return round(float(max(vals) if op == "max" else min(vals)), 2)
+
+    return {
+        "volume_ts": hhmmss,
+        "volume_time_utc": f"{hhmmss[0:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}",
+        "sweep_elev_deg": round(float(elev_angles[sweep_idx]), 2),
+        "gate_count": len(z_vals),
+        "Z":   _peak_or_none(z_vals, "max"),
+        "ZDR": _peak_or_none(extracted["ZDR"], "max"),
+        "CC":  _peak_or_none(extracted["CC"], "min"),    # CC depression = hail
+        "KDP": _peak_or_none(extracted["KDP"], "max"),
+    }
+
+
+def classify_hail_signature(z, zdr, cc, kdp, beam_height_ft):
+    """Rule-based hail classification from dual-pol values at the forensic
+    gate. Returns (hsda_class, hca_class, narrative).
+
+    Thresholds adapted from Heinselman & Ryzhkov 2006 ("Validation of
+    Polarimetric Hail Detection") and Park et al. 2009 ("HCA on the WSR-88D")
+    — simplified for forensic use without a sounding profile. The lowest
+    tilt (0.5°) at typical CONUS ranges sits below the freezing level, so we
+    treat below-melting-layer dual-pol signatures as the relevant regime.
+
+    Caveat: this is a deterministic rule set, not a Bayesian classifier. It's
+    designed to be defensible and explainable rather than maximally accurate.
+    The narrative explains exactly which thresholds drove the verdict.
+    """
+    if z is None:
+        return ("Unknown", "Unknown", "Insufficient reflectivity at property gates.")
+
+    high_cc = cc is not None and cc > 0.97
+    low_cc = cc is not None and cc < 0.92
+    very_low_cc = cc is not None and cc < 0.85
+    high_zdr = zdr is not None and zdr > 1.5
+    near_zero_zdr = zdr is not None and -0.5 < zdr < 1.0
+
+    # Heavy rain — large oblate raindrops give high CC + high ZDR
+    if z >= 50 and high_cc and high_zdr:
+        return ("None", "Heavy Rain",
+                f"Z={z:.0f} dBZ but CC={cc:.2f} (>0.97) and ZDR={zdr:.1f} dB (>1.5) — heavy-rain signature, no hail.")
+
+    # Giant hail (>2″) — extreme Z + strong CC depression + ZDR near zero
+    if z >= 65 and very_low_cc and near_zero_zdr:
+        return ("Giant (>2\")", "Large Hail",
+                f"Z={z:.0f} dBZ + CC={cc:.2f} (<0.85, strong depression) + ZDR≈0 — giant-hail signature.")
+
+    # Large hail (1–2″)
+    if z >= 60 and low_cc and (zdr is None or zdr < 1.5):
+        zdr_part = f", ZDR={zdr:.1f} dB" if zdr is not None else ""
+        return ("Large (1-2\")", "Large Hail",
+                f"Z={z:.0f} dBZ + CC={cc:.2f} (<0.92){zdr_part} — large-hail signature.")
+
+    # Small hail / hail-rain mix — moderate-to-high Z + some CC depression
+    if z >= 55 and cc is not None and cc < 0.97:
+        return ("Small (<1\")", "Hail / Rain Mix",
+                f"Z={z:.0f} dBZ + CC={cc:.2f} — small-hail or hail-rain mix.")
+
+    # No hail signature
+    if z >= 50:
+        return ("None", "Heavy Precipitation",
+                f"Z={z:.0f} dBZ — strong precipitation but no severe-hail signature.")
+
+    return ("None", "Light/Moderate Precip",
+            f"Z={z:.0f} dBZ — no significant precipitation at property gate.")
+
+
 def nexrad_list_volumes(radar_id, date):
     """Enumerate NEXRAD Level 2 volume keys for a radar+date.
 
@@ -999,9 +1212,50 @@ def nexrad_verify():
     beam_height_km = range_km * tan(elev_rad) + (range_km ** 2) / (2.0 * Re_eff_km)
     beam_height_ft = beam_height_km * 3280.84
 
+    # 7) Parse the picked volumes and pick the strongest forensic gate.
+    findings = None
+    if pyart is None:
+        findings = {"error": "pyart not available in this build", "detail": _PYART_IMPORT_ERROR}
+    else:
+        per_volume = []
+        for hhmmss, url, _vmin in picked:
+            info = parse_nexrad_volume(url, rid, hhmmss, date, lat, lon, rlat, rlon)
+            if info is not None:
+                per_volume.append(info)
+
+        if not per_volume:
+            findings = {"error": "no_volumes_parsed",
+                        "message": "All picked volumes either failed to download or had no gates near the property."}
+        else:
+            with_z = [v for v in per_volume if v.get("Z") is not None]
+            if not with_z:
+                findings = {"error": "no_reflectivity",
+                            "message": "Volumes parsed but no reflectivity data at property gates.",
+                            "volumes_analyzed": len(per_volume)}
+            else:
+                peak = max(with_z, key=lambda v: v["Z"])
+                hsda, hca, narrative = classify_hail_signature(
+                    peak.get("Z"), peak.get("ZDR"), peak.get("CC"), peak.get("KDP"),
+                    beam_height_ft,
+                )
+                findings = {
+                    "peak_volume_ts": peak["volume_ts"],
+                    "peak_volume_utc": peak["volume_time_utc"],
+                    "gate_count": peak["gate_count"],
+                    "sweep_elev_deg": peak["sweep_elev_deg"],
+                    "Z":   peak.get("Z"),
+                    "ZDR": peak.get("ZDR"),
+                    "CC":  peak.get("CC"),
+                    "KDP": peak.get("KDP"),
+                    "hsda_class": hsda,
+                    "hca_class":  hca,
+                    "narrative":  narrative,
+                    "volumes_analyzed": len(per_volume),
+                }
+
     return jsonify({
         "ok": True,
-        "phase": "scaffold",      # will be "complete" once py-art parsing is wired
+        "phase": "complete" if (findings and "error" not in findings) else "partial",
         "lat_q": round(lat, 4),
         "lon_q": round(lon, 4),
         "date": date.isoformat(),
@@ -1019,8 +1273,7 @@ def nexrad_verify():
         "volumes_in_window": len(in_window),
         "volumes_picked": len(picked),
         "picked_timestamps": [v[0] for v in picked],
-        "findings": None,         # filled in by Phase D-2
-        "message": "Plan generated. Volume parsing not yet implemented — confirms radar selection and window narrowing.",
+        "findings": findings,
     })
 
 
@@ -1030,8 +1283,11 @@ def health():
         "status": "ok",
         "eccodes": eccodes is not None,
         "eccodes_error": _ECCODES_IMPORT_ERROR,
+        "eccodes_version": eccodes.codes_get_api_version() if eccodes else None,
+        "pyart": pyart is not None,
+        "pyart_error": _PYART_IMPORT_ERROR,
+        "pyart_version": getattr(pyart, "__version__", None) if pyart else None,
         "cache_db": os.path.exists(DB_PATH),
-        "version": eccodes.codes_get_api_version() if eccodes else None,
     })
 
 

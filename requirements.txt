@@ -3,3 +3,13 @@ flask-cors==5.0.0
 gunicorn==23.0.0
 requests==2.32.3
 eccodes==2.38.3
+
+# Phase D — NEXRAD Level 2 forensic verification.
+# arm-pyart parses WSR-88D archive volumes (reflectivity, ZDR, CC, KDP,
+# elevation/azimuth geometry, HCA/HSDA classification). Pulls in numpy +
+# scipy + matplotlib + netCDF4. Container size ~doubles when these install.
+arm-pyart==1.19.3
+numpy==1.26.4
+scipy==1.13.1
+netCDF4==1.7.1
+matplotlib==3.9.2

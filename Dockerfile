@@ -2,10 +2,14 @@
 # Python + eccodes (system library) for GRIB2 parsing.
 FROM python:3.12-slim
 
-# eccodes: system library required by the Python bindings to parse GRIB2 files.
-# build-essential + python3-dev: for any pip wheels that need compilation.
+# System libraries:
+#   libeccodes0          — GRIB2 parsing for the MRMS pipeline (eccodes Python bindings).
+#   libhdf5-dev / libnetcdf-dev — required by netCDF4 wheel build / arm-pyart for
+#                          NEXRAD Level 2 archive parsing.
+#   ca-certificates curl — TLS roots + the healthcheck shell command.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libeccodes0 libeccodes-tools \
+        libhdf5-dev libnetcdf-dev \
         ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 
