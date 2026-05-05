@@ -55,6 +55,8 @@ except Exception as _ecc_err:  # noqa: BLE001
 else:
     _ECCODES_IMPORT_ERROR = None
 
+from wsr88d_sites import nearest_radar, haversine_mi
+
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
@@ -850,6 +852,171 @@ def probe():
     return jsonify({"date": date.isoformat(), "results": results})
 
 
+# -----------------------------------------------------------------------------
+# NEXRAD Level 2 — radar verification (Phase D)
+# -----------------------------------------------------------------------------
+def nexrad_list_volumes(radar_id, date):
+    """Enumerate NEXRAD Level 2 volume keys in noaa-nexrad-level2 for a
+    radar+date. Bucket layout:
+        s3://noaa-nexrad-level2/<YYYY>/<MM>/<DD>/<RID>/<RID><YYYYMMDD>_<HHMMSS>_V06[.gz]
+
+    Returns list of (hhmmss, full_url) sorted ascending. Filters out the
+    "MDM" (metadata-only) and tar-archive sentinel files some radars emit.
+    """
+    yyyy = date.strftime("%Y")
+    mm = date.strftime("%m")
+    dd = date.strftime("%d")
+    prefix = f"{yyyy}/{mm}/{dd}/{radar_id}/"
+    list_url = (
+        f"https://noaa-nexrad-level2.s3.amazonaws.com/"
+        f"?list-type=2&prefix={prefix}&max-keys=1000"
+    )
+    try:
+        r = requests.get(list_url, timeout=15, headers=HTTP_HEADERS)
+        if r.status_code != 200:
+            LOG.info(f"NEXRAD list returned {r.status_code} for {radar_id}/{yyyy}{mm}{dd}")
+            return []
+        keys = re.findall(r"<Key>([^<]+)</Key>", r.text)
+        results = []
+        for k in keys:
+            # Skip MDM (metadata-only) and any non-V06 files
+            if "MDM" in k or k.endswith(".tar"):
+                continue
+            # Filename: KFWS20240926_193245_V06 (sometimes .gz)
+            m = re.search(r"_(\d{6})_V0[5-6]", k)
+            if not m:
+                continue
+            results.append((m.group(1), f"https://noaa-nexrad-level2.s3.amazonaws.com/{k}"))
+        results.sort()
+        return results
+    except requests.RequestException as e:
+        LOG.info(f"NEXRAD list exception {radar_id}/{yyyy}{mm}{dd}: {type(e).__name__}: {e}")
+        return []
+
+
+def parse_window(s):
+    """Parse a peak window string like '18:00-24:00' into (start_min, end_min)."""
+    try:
+        a, b = s.split("-")
+        ah, am = a.split(":")
+        bh, bm = b.split(":")
+        start = int(ah) * 60 + int(am)
+        end = int(bh) * 60 + int(bm)
+        if end <= start:
+            end = 24 * 60
+        return start, end
+    except Exception:
+        return None
+
+
+@app.route("/api/nexrad-verify")
+def nexrad_verify():
+    """NEXRAD Level 2 hail verification — Phase D scaffold.
+
+    This first iteration does the *planning* (radar selection, volume listing,
+    window narrowing) but does NOT yet parse the volumes. Returns the analysis
+    plan so we can confirm radar choice + volume coverage on the test address
+    before adding py-art. The next iteration will swap the placeholder
+    `findings` block for real HCA/HSDA + dual-pol gate values.
+
+    Query params:
+        lat, lon, date (YYYY-MM-DD)        — required
+        peak_window=HH:MM-HH:MM            — optional; if omitted we'll use the
+                                              MESH peak window from event-detail
+                                              cache, falling back to 12:00-24:00.
+    """
+    try:
+        lat = float(request.args.get("lat"))
+        lon = float(request.args.get("lon"))
+        date = dt.datetime.strptime(request.args.get("date", ""), "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return jsonify({"error": "Use lat=<deg>&lon=<deg>&date=YYYY-MM-DD."}), 400
+
+    # 1) Pick nearest radar
+    nr = nearest_radar(lat, lon, max_dist_mi=150.0)
+    if not nr:
+        return jsonify({
+            "ok": False,
+            "reason": "no_nearby_radar",
+            "message": "No WSR-88D within 150 mi of the property — NEXRAD verification not available here.",
+        })
+    rid, rdist, rname, rlat, rlon, relev = nr
+
+    # 2) Determine analysis time window
+    peak_window = request.args.get("peak_window", "").strip()
+    win = parse_window(peak_window) if peak_window else None
+    if not win:
+        # Fall back to the cached event-detail peak window
+        cached = detail_cache_get(round(lat, 2), round(lon, 2), date.isoformat())
+        if cached and cached.get("mesh", {}).get("peak_window_utc"):
+            peak_window = cached["mesh"]["peak_window_utc"]
+            win = parse_window(peak_window)
+        if not win:
+            peak_window = "12:00-24:00"
+            win = (12 * 60, 24 * 60)
+    win_start, win_end = win
+
+    # 3) List Level 2 volumes for that radar+date
+    all_volumes = nexrad_list_volumes(rid, date)
+    if not all_volumes:
+        return jsonify({
+            "ok": False,
+            "reason": "no_volumes",
+            "message": f"No Level 2 volumes available on AWS for {rid} on {date.isoformat()}.",
+            "radar": {"id": rid, "name": rname, "distance_mi": round(rdist, 1)},
+        })
+
+    # 4) Filter to volumes inside the peak window, plus a small buffer
+    BUFFER_MIN = 15
+    in_window = []
+    for hhmmss, url in all_volumes:
+        v_min = int(hhmmss[0:2]) * 60 + int(hhmmss[2:4])
+        if (win_start - BUFFER_MIN) <= v_min <= (win_end + BUFFER_MIN):
+            in_window.append((hhmmss, url, v_min))
+
+    # 5) Subsample so we don't process 80+ volumes — pick ~8 evenly across the window
+    MAX_VOLUMES = 8
+    if len(in_window) > MAX_VOLUMES:
+        step = len(in_window) / MAX_VOLUMES
+        picked = [in_window[int(i * step)] for i in range(MAX_VOLUMES)]
+    else:
+        picked = in_window
+
+    # 6) Compute beam height at the property's range from the radar.
+    # WSR-88D lowest tilt is 0.5°. Beam height (AGL) at range r (km) ≈
+    # r * tan(elev) + r²/(2 * Re_eff) where Re_eff = 4/3 * 6371 km.
+    from math import radians, tan
+    range_km = rdist * 1.609344
+    elev_rad = radians(0.5)
+    Re_eff_km = (4.0 / 3.0) * 6371.0
+    beam_height_km = range_km * tan(elev_rad) + (range_km ** 2) / (2.0 * Re_eff_km)
+    beam_height_ft = beam_height_km * 3280.84
+
+    return jsonify({
+        "ok": True,
+        "phase": "scaffold",      # will be "complete" once py-art parsing is wired
+        "lat_q": round(lat, 4),
+        "lon_q": round(lon, 4),
+        "date": date.isoformat(),
+        "radar": {
+            "id": rid,
+            "name": rname,
+            "lat": rlat,
+            "lon": rlon,
+            "elev_ft": relev,
+            "distance_mi": round(rdist, 1),
+            "beam_height_ft_at_property": round(beam_height_ft),
+        },
+        "window_utc": peak_window,
+        "volumes_total_for_day": len(all_volumes),
+        "volumes_in_window": len(in_window),
+        "volumes_picked": len(picked),
+        "picked_timestamps": [v[0] for v in picked],
+        "findings": None,         # filled in by Phase D-2
+        "message": "Plan generated. Volume parsing not yet implemented — confirms radar selection and window narrowing.",
+    })
+
+
 @app.route("/health")
 def health():
     return jsonify({
@@ -866,9 +1033,10 @@ def root():
     return jsonify({
         "service": "PropertyWX MRMS forensic lookup",
         "endpoints": {
-            "GET /api/mesh":         "params: lat, lon, date (YYYY-MM-DD); returns mesh_in (24h max) + source",
-            "GET /api/event-detail": "params: lat, lon, date; returns full multi-signal record (mesh max + peak hour + posh)",
-            "GET /health":           "service status",
+            "GET /api/mesh":          "params: lat, lon, date (YYYY-MM-DD); returns mesh_in (24h max) + source",
+            "GET /api/event-detail":  "params: lat, lon, date; returns full multi-signal record (mesh max + peak hour + posh)",
+            "GET /api/nexrad-verify": "params: lat, lon, date, [peak_window]; NEXRAD Level 2 hail verification (Phase D)",
+            "GET /health":            "service status",
         },
     })
 
