@@ -1009,9 +1009,23 @@ def parse_nexrad_volume(url, radar_id, hhmmss, date, prop_lat, prop_lon,
     if not per_gate:
         return None
 
-    # The forensic gate is the one with peak reflectivity. ZDR / CC / KDP are
-    # whatever values that *same gate* has — coherent dual-pol fingerprint.
-    peak_gate = max(per_gate, key=lambda g: g["Z"])
+    # The forensic gate is the one with the most hail-like dual-pol signature
+    # among gates with Z ≥ 50 dBZ (real precipitation). Hail-likeness is
+    # primarily driven by |ZDR| being close to zero — tumbling, irregular
+    # hailstones produce near-zero ZDR even when wet hail keeps CC high. If
+    # no gate clears the 50 dBZ floor, fall back to the peak-Z gate so we
+    # still report something coherent.
+    candidates = [g for g in per_gate if g["Z"] >= 50.0]
+    if candidates:
+        def _hail_likeness_score(g):
+            # Lower score = more hail-like. Primary term is |ZDR|, with
+            # CC and KDP acting as tiebreakers.
+            zdr_term = abs(g["ZDR"]) if g["ZDR"] is not None else 5.0
+            cc_term  = (g["CC"] if g["CC"] is not None else 1.0) * 0.5
+            return zdr_term + cc_term
+        peak_gate = min(candidates, key=_hail_likeness_score)
+    else:
+        peak_gate = max(per_gate, key=lambda g: g["Z"])
 
     def _r(v, n=2):
         return None if v is None else round(v, n)
@@ -1104,49 +1118,65 @@ def classify_hail_signature(z, zdr, cc, kdp, beam_height_ft):
     gate. Returns (hsda_class, hca_class, narrative).
 
     Thresholds adapted from Heinselman & Ryzhkov 2006 ("Validation of
-    Polarimetric Hail Detection") and Park et al. 2009 ("HCA on the WSR-88D")
-    — simplified for forensic use without a sounding profile. The lowest
-    tilt (0.5°) at typical CONUS ranges sits below the freezing level, so we
-    treat below-melting-layer dual-pol signatures as the relevant regime.
+    Polarimetric Hail Detection") and Park et al. 2009 ("HCA on the WSR-88D"),
+    with **ZDR promoted as the primary discriminator** based on the
+    observation that wet/melting hail can keep CC > 0.95 (water coating makes
+    scattering more coherent) while pure raindrops at high Z always show
+    ZDR > 1.5 dB. ZDR near zero at high reflectivity is essentially
+    pathognomonic for hail.
 
-    Caveat: this is a deterministic rule set, not a Bayesian classifier. It's
-    designed to be defensible and explainable rather than maximally accurate.
-    The narrative explains exactly which thresholds drove the verdict.
+    Decision order:
+        1. Z ≥ 50 + ZDR ≈ 0 → hail (size by Z tier). CC depression strengthens
+           confidence but is not required (covers wet-hail case).
+        2. Z ≥ 50 + ZDR > 1.5 → heavy rain (large oblate drops).
+        3. Otherwise: weak signal or mix; classify accordingly.
     """
     if z is None:
         return ("Unknown", "Unknown", "Insufficient reflectivity at property gates.")
 
-    high_cc = cc is not None and cc > 0.97
-    low_cc = cc is not None and cc < 0.92
-    very_low_cc = cc is not None and cc < 0.85
-    high_zdr = zdr is not None and zdr > 1.5
-    near_zero_zdr = zdr is not None and -0.5 < zdr < 1.0
+    # Primary discriminator: ZDR
+    near_zero_zdr = zdr is not None and -1.0 <= zdr <= 1.5
+    high_zdr      = zdr is not None and zdr > 2.0
+    # Secondary: CC depression. Used to strengthen narrative; not required
+    # to call hail because of the wet-hail case.
+    cc_depressed   = cc is not None and cc < 0.95
+    cc_strong_dep  = cc is not None and cc < 0.85
 
-    # Heavy rain — large oblate raindrops give high CC + high ZDR
-    if z >= 50 and high_cc and high_zdr:
+    # Hail signatures (ZDR-primary)
+    if z is not None and near_zero_zdr:
+        if z >= 65:
+            cc_note = f", CC={cc:.2f} ({'strong depression' if cc_strong_dep else 'depressed' if cc_depressed else 'high — wet-hail mix likely'})" if cc is not None else ""
+            return ("Giant (>2\")", "Large Hail",
+                    f"Z={z:.0f} dBZ + ZDR={zdr:.1f} dB (≈0){cc_note} — giant-hail signature.")
+        if z >= 60:
+            cc_note = f", CC={cc:.2f}" if cc is not None else ""
+            return ("Large (1-2\")", "Large Hail",
+                    f"Z={z:.0f} dBZ + ZDR={zdr:.1f} dB (≈0){cc_note} — large-hail signature.")
+        if z >= 55:
+            cc_note = f", CC={cc:.2f}" if cc is not None else ""
+            return ("Large (1-2\")", "Hail",
+                    f"Z={z:.0f} dBZ + ZDR={zdr:.1f} dB (≈0){cc_note} — hail signature; size at lower bound of Large.")
+        if z >= 50:
+            cc_note = f", CC={cc:.2f}" if cc is not None else ""
+            return ("Small (<1\")", "Hail / Rain Mix",
+                    f"Z={z:.0f} dBZ + ZDR={zdr:.1f} dB (≈0){cc_note} — small hail or hail-rain mix.")
+
+    # Heavy rain (high ZDR rules it out as hail)
+    if z is not None and z >= 50 and high_zdr:
+        cc_note = f", CC={cc:.2f}" if cc is not None else ""
         return ("None", "Heavy Rain",
-                f"Z={z:.0f} dBZ but CC={cc:.2f} (>0.97) and ZDR={zdr:.1f} dB (>1.5) — heavy-rain signature, no hail.")
+                f"Z={z:.0f} dBZ + ZDR={zdr:.1f} dB (>2 = oblate raindrops){cc_note} — heavy-rain signature, no hail.")
 
-    # Giant hail (>2″) — extreme Z + strong CC depression + ZDR near zero
-    if z >= 65 and very_low_cc and near_zero_zdr:
-        return ("Giant (>2\")", "Large Hail",
-                f"Z={z:.0f} dBZ + CC={cc:.2f} (<0.85, strong depression) + ZDR≈0 — giant-hail signature.")
-
-    # Large hail (1–2″)
-    if z >= 60 and low_cc and (zdr is None or zdr < 1.5):
-        zdr_part = f", ZDR={zdr:.1f} dB" if zdr is not None else ""
-        return ("Large (1-2\")", "Large Hail",
-                f"Z={z:.0f} dBZ + CC={cc:.2f} (<0.92){zdr_part} — large-hail signature.")
-
-    # Small hail / hail-rain mix — moderate-to-high Z + some CC depression
-    if z >= 55 and cc is not None and cc < 0.97:
+    # Mid-range ZDR with high Z — ambiguous; CC depression tilts toward hail-mix
+    if z is not None and z >= 55 and cc_depressed:
         return ("Small (<1\")", "Hail / Rain Mix",
-                f"Z={z:.0f} dBZ + CC={cc:.2f} — small-hail or hail-rain mix.")
+                f"Z={z:.0f} dBZ + CC={cc:.2f} (depressed) — hail-rain mix likely.")
 
-    # No hail signature
-    if z >= 50:
+    if z is not None and z >= 50:
+        zdr_part = f", ZDR={zdr:.1f} dB" if zdr is not None else ""
+        cc_part  = f", CC={cc:.2f}" if cc is not None else ""
         return ("None", "Heavy Precipitation",
-                f"Z={z:.0f} dBZ — strong precipitation but no severe-hail signature.")
+                f"Z={z:.0f} dBZ{zdr_part}{cc_part} — strong precipitation, no clear hail signature.")
 
     return ("None", "Light/Moderate Precip",
             f"Z={z:.0f} dBZ — no significant precipitation at property gate.")
