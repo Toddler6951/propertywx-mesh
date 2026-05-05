@@ -209,7 +209,9 @@ def aws_list_keys(product_dir, date):
         for k in keys:
             if not k.endswith(".grib2.gz"):
                 continue
-            m = re.search(r"-(\d{8})-(\d{6})\.grib2\.gz$", k)
+            # MRMS filenames use either "-YYYYMMDD-HHMMSS" or "_YYYYMMDD-HHMMSS"
+            # depending on product naming (e.g. POSH_00.50_20240423-000032).
+            m = re.search(r"[_-](\d{8})-(\d{6})\.grib2\.gz$", k)
             if not m:
                 continue
             results.append((m.group(2), f"https://noaa-mrms-pds.s3.amazonaws.com/{k}"))
@@ -256,7 +258,8 @@ def iastate_list_keys(product_dir, date):
         yyyymmdd = date.strftime("%Y%m%d")
         results = []
         for h in hrefs:
-            m = re.search(rf"-{yyyymmdd}-(\d{{6}})\.grib2\.gz$", h)
+            # Char before YYYYMMDD is "_" (e.g. MESH_Max_1440min_00.50_20240423-180000)
+            m = re.search(rf"[_-]{yyyymmdd}-(\d{{6}})\.grib2\.gz$", h)
             if not m:
                 continue
             results.append((m.group(1), base_url + h))
