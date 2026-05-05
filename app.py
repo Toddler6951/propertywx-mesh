@@ -15,8 +15,10 @@ Endpoints:
                     "source":          <str|null>,
                 },
                 "posh": {
-                    "max_pct":         <int|null>,     # 0..100
+                    "max_pct":         <int|null>,           # 0..100
                     "peak_window_utc": <"HH:MM-HH:MM"|null>,
+                    "peak_ts":         <"HHMMSS"|null>,      # exact frame when finescan ran
+                    "scan_count":      <int>,                # # of POSH frames sampled
                     "source":          <str|null>,
                 },
                 "samples":  <list of (window_utc, mesh_in, posh_pct)>,
@@ -421,7 +423,8 @@ def get_event_detail(lat, lon, date):
     mesh_peak_in = None
     mesh_peak_window = None
     mesh_peak_source = None
-    for label, hour, minute in SAMPLE_HOURS:
+    mesh_peak_idx = None
+    for idx, (label, hour, minute) in enumerate(SAMPLE_HOURS):
         gp, src, _ = fetch_mesh_360min_grib(date, hour, minute)
         v_in = None
         if gp:
@@ -432,28 +435,84 @@ def get_event_detail(lat, lon, date):
             except Exception:
                 LOG.exception(f"MESH 360min extract failed @ {label}")
         samples.append({"window_utc": label, "mesh_in": v_in, "posh_pct": None,
-                        "_hour": hour, "_minute": minute, "_source": src})
+                        "_hour": hour, "_minute": minute,
+                        "_source": src, "_idx": idx})
         if v_in is not None and (mesh_peak_in is None or v_in > mesh_peak_in):
             mesh_peak_in = v_in
             mesh_peak_window = label
             mesh_peak_source = src
+            mesh_peak_idx = idx
 
-    # 3) POSH samples — instantaneous, taken at end of each MESH window
+    # 3) POSH sampling — strategy depends on whether MESH detected hail.
+    #
+    # POSH is *instantaneous*; sampling at fixed 6-hour boundaries usually
+    # misses the storm and reads 0% even when MESH > 0. To make POSH actually
+    # useful, when MESH 360min identifies a peak window, we scan POSH at
+    # 15-minute cadence inside that window only (24 fetches over 6h). On
+    # silent days (MESH 0 everywhere) we fall back to the cheap 4-sample
+    # schedule so we don't waste fetches.
     posh_max_pct = None
     posh_peak_window = None
+    posh_peak_ts = None
     posh_source = None
-    for s in samples:
-        gp, src, _ = fetch_posh_grib(date, s["_hour"], s["_minute"])
-        if gp:
+    posh_scan_count = 0
+
+    if mesh_peak_in and mesh_peak_in > 0 and mesh_peak_idx is not None:
+        # Fine-grained POSH scan within the MESH peak window
+        window_start_hr = mesh_peak_idx * 6
+        window_end_hr = window_start_hr + 6
+        scan_targets = []
+        for h in range(window_start_hr, window_end_hr):
+            for m in (0, 15, 30, 45):
+                scan_targets.append((h, m))
+        # Cap final hour at 23:58 to avoid running off the day
+        if window_end_hr >= 24:
+            scan_targets.append((23, 58))
+        else:
+            scan_targets.append((window_end_hr, 0))
+
+        peak_label = SAMPLE_HOURS[mesh_peak_idx][0]
+        for (h, m) in scan_targets:
+            gp, src, hhmmss = fetch_posh_grib(date, h, m)
+            if not gp:
+                continue
             try:
                 v = extract_value(gp, lat, lon)
-                if v is not None:
-                    pct = max(0, min(100, int(round(v))))
-                    s["posh_pct"] = pct
-                    if posh_max_pct is None or pct > posh_max_pct:
-                        posh_max_pct = pct
-                        posh_peak_window = s["window_utc"]
-                        posh_source = src
+                if v is None:
+                    continue
+                pct = max(0, min(100, int(round(v))))
+                posh_scan_count += 1
+                if posh_max_pct is None or pct > posh_max_pct:
+                    posh_max_pct = pct
+                    posh_peak_window = peak_label
+                    posh_peak_ts = hhmmss
+                    posh_source = src
+            except Exception:
+                LOG.exception(f"POSH extract failed @ {h:02d}:{m:02d}")
+
+        # Stamp the peak-window sample so the public samples array reflects it
+        if posh_max_pct is not None:
+            for s in samples:
+                if s["_idx"] == mesh_peak_idx:
+                    s["posh_pct"] = posh_max_pct
+                    break
+    else:
+        # Cheap fallback: instantaneous POSH at the 4 fixed sample times.
+        for s in samples:
+            gp, src, _ = fetch_posh_grib(date, s["_hour"], s["_minute"])
+            if not gp:
+                continue
+            try:
+                v = extract_value(gp, lat, lon)
+                if v is None:
+                    continue
+                pct = max(0, min(100, int(round(v))))
+                s["posh_pct"] = pct
+                posh_scan_count += 1
+                if posh_max_pct is None or pct > posh_max_pct:
+                    posh_max_pct = pct
+                    posh_peak_window = s["window_utc"]
+                    posh_source = src
             except Exception:
                 LOG.exception(f"POSH extract failed @ {s['window_utc']}")
 
@@ -473,6 +532,8 @@ def get_event_detail(lat, lon, date):
         "posh": {
             "max_pct": posh_max_pct,
             "peak_window_utc": posh_peak_window,
+            "peak_ts": posh_peak_ts,            # exact HHMMSS within window when fine-scan was used
+            "scan_count": posh_scan_count,      # how many POSH frames were sampled
             "source": posh_source,
         },
         "samples": public_samples,
