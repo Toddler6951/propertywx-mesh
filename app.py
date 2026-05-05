@@ -1,4 +1,4 @@
-"""MRMS forensic point-query service. 
+"""MRMS forensic point-query service.
 
 Endpoints:
     GET /api/mesh?lat=&lon=&date=YYYY-MM-DD
@@ -1009,21 +1009,26 @@ def parse_nexrad_volume(url, radar_id, hhmmss, date, prop_lat, prop_lon,
     if not per_gate:
         return None
 
-    # The forensic gate is the one with the most hail-like dual-pol signature
-    # among gates with Z ≥ 50 dBZ (real precipitation). Hail-likeness is
-    # primarily driven by |ZDR| being close to zero — tumbling, irregular
-    # hailstones produce near-zero ZDR even when wet hail keeps CC high. If
-    # no gate clears the 50 dBZ floor, fall back to the peak-Z gate so we
-    # still report something coherent.
-    candidates = [g for g in per_gate if g["Z"] >= 50.0]
-    if candidates:
-        def _hail_likeness_score(g):
-            # Lower score = more hail-like. Primary term is |ZDR|, with
-            # CC and KDP acting as tiebreakers.
-            zdr_term = abs(g["ZDR"]) if g["ZDR"] is not None else 5.0
-            cc_term  = (g["CC"] if g["CC"] is not None else 1.0) * 0.5
-            return zdr_term + cc_term
-        peak_gate = min(candidates, key=_hail_likeness_score)
+    # The forensic gate selection has two priorities:
+    #   1. Among precipitation gates (Z ≥ 50 dBZ), prefer ones with hail-like
+    #      ZDR (|ZDR| ≤ 1.5 — tumbling hailstones give near-zero ZDR; pure
+    #      raindrops at high Z always show ZDR > 1.5).
+    #   2. Within that hail-like subset, pick the gate with the HIGHEST Z —
+    #      that's the biggest hailstones near the property, which is what
+    #      drives forensic claim severity. Pristine ZDR ties (e.g. ZDR=0.09
+    #      vs 0.28) shouldn't trump higher Z; both are hail, the higher-Z
+    #      one is just bigger hail.
+    # If no gate has both Z ≥ 50 and hail-like ZDR, we fall back to the
+    # peak-Z precipitation gate so the classifier still produces a verdict
+    # (which will likely come back as Heavy Rain or Heavy Precipitation).
+    precip_gates = [g for g in per_gate if g["Z"] >= 50.0]
+    if precip_gates:
+        hail_like = [g for g in precip_gates
+                     if g["ZDR"] is not None and -1.0 <= g["ZDR"] <= 1.5]
+        if hail_like:
+            peak_gate = max(hail_like, key=lambda g: g["Z"])
+        else:
+            peak_gate = max(precip_gates, key=lambda g: g["Z"])
     else:
         peak_gate = max(per_gate, key=lambda g: g["Z"])
 
