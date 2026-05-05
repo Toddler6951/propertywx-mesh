@@ -179,24 +179,37 @@ def grib_local_path(product_dir, date, hhmmss=None):
     )
 
 
-def _fetch_grib(product_dir, date, ts_attempts):
-    """Try AWS, then Iowa State. Try each timestamp in ts_attempts in order.
-    Returns (local_path, source_name, hhmmss_used) or (None, None, None)."""
+def _candidate_urls(product_dir, date, ts):
+    """All URL variations we'll try for a (product, date, timestamp).
+
+    AWS uses the full product name (with resolution suffix) as the directory.
+    Iowa State's mtarchive uses the bare product name (without _00.50) as the
+    directory but keeps the suffix in the filename. Some products on Iowa
+    State also use the full name as the directory, so we try both."""
     yyyymmdd = date.strftime("%Y%m%d")
     yyyy, mm, dd = date.strftime("%Y"), date.strftime("%m"), date.strftime("%d")
-
-    sources = [
+    # "MESH_Max_1440min_00.50" → "MESH_Max_1440min"
+    short_dir = product_dir.rsplit("_00.", 1)[0]
+    return [
         ("AWS",
-         lambda ts: f"https://noaa-mrms-pds.s3.amazonaws.com/CONUS/{product_dir}/{yyyymmdd}/MRMS_{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
+         f"https://noaa-mrms-pds.s3.amazonaws.com/CONUS/{product_dir}/{yyyymmdd}/MRMS_{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
         ("Iowa State",
-         lambda ts: f"https://mtarchive.geol.iastate.edu/{yyyy}/{mm}/{dd}/mrms/ncep/{product_dir}/{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
+         f"https://mtarchive.geol.iastate.edu/{yyyy}/{mm}/{dd}/mrms/ncep/{short_dir}/{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
+        ("Iowa State (alt)",
+         f"https://mtarchive.geol.iastate.edu/{yyyy}/{mm}/{dd}/mrms/ncep/{product_dir}/{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
     ]
-    for source_name, url_fn in sources:
-        for ts in ts_attempts:
-            local = grib_local_path(product_dir, date, ts)
-            if os.path.exists(local):
-                return local, "cache", ts
-            url = url_fn(ts)
+
+
+def _fetch_grib(product_dir, date, ts_attempts):
+    """Try AWS, then Iowa State (both directory conventions). Try each
+    timestamp in ts_attempts in order. Returns (local_path, source_name,
+    hhmmss_used) or (None, None, None)."""
+    last_status = None
+    for ts in ts_attempts:
+        local = grib_local_path(product_dir, date, ts)
+        if os.path.exists(local):
+            return local, "cache", ts
+        for source_name, url in _candidate_urls(product_dir, date, ts):
             try:
                 r = requests.get(url, timeout=HTTP_TIMEOUT)
                 if r.status_code == 200 and r.content:
@@ -206,10 +219,13 @@ def _fetch_grib(product_dir, date, ts_attempts):
                     with open(local, "wb") as f:
                         f.write(raw)
                     return local, source_name, ts
+                last_status = f"{source_name} {r.status_code}"
                 LOG.debug(f"  {url} -> HTTP {r.status_code}")
             except requests.RequestException as e:
+                last_status = f"{source_name} EXC {type(e).__name__}"
                 LOG.debug(f"  {url} -> {e}")
                 continue
+    LOG.warning(f"no source had {product_dir} for {date.isoformat()} (last: {last_status})")
     return None, None, None
 
 
@@ -445,10 +461,10 @@ def event_detail():
     lon_q = round(lon, 2)
     date_str = date.isoformat()
 
-    cached = detail_cache_get(lat_q, lon_q, date_str)
+    refresh = request.args.get("refresh", "").lower() in ("1", "true", "yes")
+    cached = None if refresh else detail_cache_get(lat_q, lon_q, date_str)
     if cached is not None:
         cached_copy = dict(cached)
-        # Annotate that this came from cache without mutating the cached source name
         m = dict(cached_copy.get("mesh") or {})
         if m.get("source"):
             m["source"] = m["source"] + " (cached)"
@@ -461,7 +477,17 @@ def event_detail():
         LOG.exception("event-detail orchestration failed")
         return jsonify({"error": f"Backend error: {e}"}), 500
 
-    detail_cache_put(lat_q, lon_q, date_str, detail)
+    # Only cache if at least one signal succeeded; an all-null record likely
+    # reflects a transient fetch failure rather than genuine no-data.
+    has_signal = (
+        (detail.get("mesh") or {}).get("max_in") is not None
+        or (detail.get("mesh") or {}).get("peak_in") is not None
+        or (detail.get("posh") or {}).get("max_pct") is not None
+    )
+    if has_signal:
+        detail_cache_put(lat_q, lon_q, date_str, detail)
+    else:
+        detail["note"] = "No signal retrieved; result not cached. Retry or check backend logs for URL attempts."
     return jsonify(detail)
 
 
