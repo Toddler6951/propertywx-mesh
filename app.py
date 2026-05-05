@@ -500,6 +500,47 @@ def event_detail():
     return jsonify(detail)
 
 
+@app.route("/api/probe")
+def probe():
+    """Diagnostic: try a fetch for each product and return what URLs we tried
+    and what the responses were. Hits the network but does NOT cache or parse —
+    just confirms whether the archives reply with 200 vs 403 vs 404 vs timeout.
+
+    Usage:
+        /api/probe?date=YYYY-MM-DD
+    """
+    try:
+        date_str = request.args.get("date", "")
+        date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return jsonify({"error": "Use date=YYYY-MM-DD."}), 400
+
+    products_to_probe = [
+        ("MESH_Max_1440min_00.50", "235800"),
+        ("MESH_Max_360min_00.50", "180000"),
+        ("POSH_00.50", "180000"),
+    ]
+    results = []
+    for product_dir, ts in products_to_probe:
+        urls = _candidate_urls(product_dir, date, ts)
+        per_url = []
+        for source_name, url in urls:
+            try:
+                r = requests.get(url, timeout=15, headers=HTTP_HEADERS,
+                                 allow_redirects=True, stream=True)
+                # Don't download the body — we only want status
+                size_hint = r.headers.get("content-length")
+                r.close()
+                per_url.append({"source": source_name, "url": url,
+                                "status": r.status_code, "size": size_hint})
+            except requests.RequestException as e:
+                per_url.append({"source": source_name, "url": url,
+                                "status": None, "error": f"{type(e).__name__}: {e}"})
+        results.append({"product": product_dir, "timestamp": ts, "attempts": per_url})
+
+    return jsonify({"date": date.isoformat(), "results": results})
+
+
 @app.route("/health")
 def health():
     return jsonify({
