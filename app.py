@@ -595,6 +595,32 @@ def event_detail():
     return jsonify(detail)
 
 
+@app.route("/api/probe-url")
+def probe_url():
+    """Diagnostic: do a raw GET against an arbitrary URL from inside the
+    Railway container and report status + length + body snippet. Lets us
+    figure out exactly why a directory listing comes back empty.
+    Usage: /api/probe-url?u=<url-encoded>"""
+    u = request.args.get("u", "")
+    if not u:
+        return jsonify({"error": "missing ?u=<url>"}), 400
+    try:
+        r = requests.get(u, timeout=20, headers=HTTP_HEADERS)
+        body = r.text or ""
+        return jsonify({
+            "url": u,
+            "status": r.status_code,
+            "length": len(body),
+            "snippet": body[:1500],
+            "final_url": r.url,
+        })
+    except requests.RequestException as e:
+        return jsonify({
+            "url": u,
+            "error": f"{type(e).__name__}: {e}",
+        }), 502
+
+
 @app.route("/api/probe")
 def probe():
     """Diagnostic: list what's available for each MRMS product on a given date
