@@ -1175,18 +1175,22 @@ def nexrad_verify():
         })
     rid, rdist, rname, rlat, rlon, relev = nr
 
-    # 2) Determine analysis time window
+    # 2) Determine analysis time window. Order of preference:
+    #    a) Explicit ?peak_window= query param
+    #    b) Cached event-detail's MESH peak window for this exact (lat, lon, date)
+    #    c) Full-day default (00:00-24:00) — the MESH_60min scan below will
+    #       narrow to the actual storm hour. This is critical for early-morning
+    #       events (storm before noon UTC) which a 12:00-24:00 default would miss.
     peak_window = request.args.get("peak_window", "").strip()
     win = parse_window(peak_window) if peak_window else None
     if not win:
-        # Fall back to the cached event-detail peak window
         cached = detail_cache_get(round(lat, 2), round(lon, 2), date.isoformat())
         if cached and cached.get("mesh", {}).get("peak_window_utc"):
             peak_window = cached["mesh"]["peak_window_utc"]
             win = parse_window(peak_window)
         if not win:
-            peak_window = "12:00-24:00"
-            win = (12 * 60, 24 * 60)
+            peak_window = "00:00-24:00"
+            win = (0, 24 * 60)
     win_start, win_end = win
 
     # 3) List Level 2 volumes for that radar+date
