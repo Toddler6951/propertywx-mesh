@@ -366,7 +366,13 @@ def fetch_posh_grib(date, hour, minute):
 # Point extraction (eccodes)
 # -----------------------------------------------------------------------------
 def extract_value(grib_path, lat, lon):
-    """Return raw MRMS value at the nearest grid cell, or None."""
+    """Return raw MRMS value (in product units) at the nearest grid cell.
+
+    Sentinel handling:
+        -1.0  = MRMS "no detection at this cell" — return 0.0 (real signal).
+        <-2   = true missing-data flag (e.g. -999 / -3) — return None.
+        None  = eccodes couldn't decode — return None.
+    """
     if eccodes is None:
         raise RuntimeError("eccodes Python bindings not installed")
     with open(grib_path, "rb") as f:
@@ -380,9 +386,14 @@ def extract_value(grib_path, lat, lon):
     if not nearest:
         return None
     val = nearest[0]["value"]
-    if val is None or val < 0:
+    if val is None:
         return None
-    return float(val)
+    val = float(val)
+    if val < -2:           # true missing-data flag
+        return None
+    if val < 0:            # MRMS no-detection sentinel (-1)
+        return 0.0
+    return val
 
 
 # -----------------------------------------------------------------------------
