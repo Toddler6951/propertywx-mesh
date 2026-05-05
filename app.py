@@ -965,53 +965,66 @@ def parse_nexrad_volume(url, radar_id, hhmmss, date, prop_lat, prop_lon,
     if rng_idx.size == 0:
         return None
 
+    # Read all four dual-pol fields per gate so we can keep them co-located.
+    # Reporting max Z from one gate and min CC from another gives incoherent
+    # numbers (e.g. peak Z=60 with CC=0.21 from a different gate that's
+    # actually biological scatter at low Z). Forensic claims need the FULL
+    # dual-pol fingerprint AT a single gate.
     field_map = {
         "Z":   "reflectivity",
         "ZDR": "differential_reflectivity",
         "CC":  "cross_correlation_ratio",
         "KDP": "specific_differential_phase",
     }
-    extracted = {short: [] for short in field_map}
-
+    sweep_arrays = {}
     for short, full in field_map.items():
-        if full not in radar.fields:
-            continue
-        sweep_data = radar.fields[full]["data"][sweep_slc]
-        for ai in az_idx:
-            for ri in rng_idx:
-                v = sweep_data[ai, ri]
-                if hasattr(v, "mask") and bool(v.mask):
-                    continue
-                try:
-                    extracted[short].append(float(v))
-                except (TypeError, ValueError):
-                    continue
+        if full in radar.fields:
+            sweep_arrays[short] = radar.fields[full]["data"][sweep_slc]
 
-    z_vals = extracted["Z"]
-    if not z_vals:
+    if "Z" not in sweep_arrays:
         return None
 
-    # The "forensic gate" is the one with peak reflectivity. We don't track
-    # gate identity per-field separately because typically all dual-pol fields
-    # are co-located, so the peak Z gate's stats include peak ZDR/CC/KDP for
-    # that gate. To stay robust, we pick the simple max of each field across
-    # the same gate set — slightly different gates may dominate per field,
-    # but that's still defensible since "peak across nearby gates" is what
-    # matters for forensic conclusions.
-    def _peak_or_none(vals, op="max"):
-        if not vals:
+    def _val(arr, ai, ri):
+        v = arr[ai, ri]
+        if hasattr(v, "mask") and bool(v.mask):
             return None
-        return round(float(max(vals) if op == "max" else min(vals)), 2)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    per_gate = []
+    for ai in az_idx:
+        for ri in rng_idx:
+            z = _val(sweep_arrays["Z"], ai, ri)
+            if z is None:
+                continue
+            per_gate.append({
+                "Z":   z,
+                "ZDR": _val(sweep_arrays["ZDR"], ai, ri) if "ZDR" in sweep_arrays else None,
+                "CC":  _val(sweep_arrays["CC"],  ai, ri) if "CC"  in sweep_arrays else None,
+                "KDP": _val(sweep_arrays["KDP"], ai, ri) if "KDP" in sweep_arrays else None,
+            })
+
+    if not per_gate:
+        return None
+
+    # The forensic gate is the one with peak reflectivity. ZDR / CC / KDP are
+    # whatever values that *same gate* has — coherent dual-pol fingerprint.
+    peak_gate = max(per_gate, key=lambda g: g["Z"])
+
+    def _r(v, n=2):
+        return None if v is None else round(v, n)
 
     return {
         "volume_ts": hhmmss,
         "volume_time_utc": f"{hhmmss[0:2]}:{hhmmss[2:4]}:{hhmmss[4:6]}",
         "sweep_elev_deg": round(float(elev_angles[sweep_idx]), 2),
-        "gate_count": len(z_vals),
-        "Z":   _peak_or_none(z_vals, "max"),
-        "ZDR": _peak_or_none(extracted["ZDR"], "max"),
-        "CC":  _peak_or_none(extracted["CC"], "min"),    # CC depression = hail
-        "KDP": _peak_or_none(extracted["KDP"], "max"),
+        "gate_count": len(per_gate),
+        "Z":   _r(peak_gate["Z"], 1),
+        "ZDR": _r(peak_gate["ZDR"], 2),
+        "CC":  _r(peak_gate["CC"], 3),
+        "KDP": _r(peak_gate["KDP"], 2),
     }
 
 
@@ -1194,13 +1207,60 @@ def nexrad_verify():
         if (win_start - BUFFER_MIN) <= v_min <= (win_end + BUFFER_MIN):
             in_window.append((hhmmss, url, v_min))
 
-    # 5) Subsample so we don't process 80+ volumes — pick ~8 evenly across the window
+    # 5) Lock onto the actual storm hour using MESH_Max_60min.
+    # MESH_Max_60min publishes the past hour's max — sampling at HH:00 gives
+    # us the magnitude during HH-1 to HH. We scan within the peak window and
+    # pick volumes within ±30 min of the hour with the highest at-property
+    # MESH_60min reading. This collapses an 8-hour spread into a 1-hour band
+    # right at the storm, which is what we need for a non-trivial Z signal.
+    storm_hour_min = None     # midpoint (in minutes from midnight) of the storm hour
+    storm_mesh_60_in = None
+    if eccodes is not None and len(in_window) > 8:
+        win_start_hr = max(0, win_start // 60)
+        win_end_hr = min(23, max(win_start_hr, win_end // 60))
+        best_v = -1.0
+        best_h = None
+        for h in range(win_start_hr, win_end_hr + 1):
+            try:
+                gp, _src, _ts = _fetch_grib("MESH_Max_60min_00.50", date,
+                                            target_hhmm=f"{h:02d}00")
+                if not gp:
+                    continue
+                v_mm = extract_value(gp, lat, lon)
+                if v_mm is None:
+                    continue
+                v_in = v_mm / 25.4
+                if v_in > best_v:
+                    best_v = v_in
+                    best_h = h
+            except Exception:
+                LOG.exception(f"MESH_60min scan failed at {h:02d}:00")
+                continue
+        if best_h is not None and best_v > 0:
+            # MESH_60min at HH:00 represents [HH-1, HH], so storm midpoint is HH-30min
+            storm_hour_min = best_h * 60 - 30
+            storm_mesh_60_in = round(best_v, 2)
+
+    # 6) Subsample. If we found a storm hour, pick volumes within ±30 min of it.
+    # Otherwise fall back to evenly-spread picks across the window.
     MAX_VOLUMES = 8
-    if len(in_window) > MAX_VOLUMES:
-        step = len(in_window) / MAX_VOLUMES
-        picked = [in_window[int(i * step)] for i in range(MAX_VOLUMES)]
+    if storm_hour_min is not None:
+        narrow = [v for v in in_window
+                  if (storm_hour_min - 30) <= v[2] <= (storm_hour_min + 30)]
+        # If our ±30 min window happens to be empty (storm-hour boundary case),
+        # fall back to ±60 min before giving up.
+        if not narrow:
+            narrow = [v for v in in_window
+                      if (storm_hour_min - 60) <= v[2] <= (storm_hour_min + 60)]
+        candidates = narrow if narrow else in_window
     else:
-        picked = in_window
+        candidates = in_window
+
+    if len(candidates) > MAX_VOLUMES:
+        step = len(candidates) / MAX_VOLUMES
+        picked = [candidates[int(i * step)] for i in range(MAX_VOLUMES)]
+    else:
+        picked = candidates
 
     # 6) Compute beam height at the property's range from the radar.
     # WSR-88D lowest tilt is 0.5°. Beam height (AGL) at range r (km) ≈
@@ -1269,6 +1329,11 @@ def nexrad_verify():
             "beam_height_ft_at_property": round(beam_height_ft),
         },
         "window_utc": peak_window,
+        "storm_hour_locked": (
+            None if storm_hour_min is None
+            else f"{storm_hour_min // 60:02d}:{storm_hour_min % 60:02d}"
+        ),
+        "storm_mesh_60min_in": storm_mesh_60_in,
         "volumes_total_for_day": len(all_volumes),
         "volumes_in_window": len(in_window),
         "volumes_picked": len(picked),
