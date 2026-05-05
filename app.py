@@ -598,6 +598,116 @@ def event_detail():
     return jsonify(detail)
 
 
+@app.route("/api/diag-fetch")
+def diag_fetch():
+    """Diagnostic: trace a full single-product fetch+extract for a
+    (lat, lon, date, product, hhmm) tuple. Reports listing count, chosen URL,
+    download size, gunzip bytes, eccodes nearest result, raw value, and any
+    exception text. Use this when /api/event-detail returns all nulls so we
+    can see exactly which step is failing.
+
+    Usage: /api/diag-fetch?lat=&lon=&date=YYYY-MM-DD&product=MESH_Max_1440min_00.50&hhmm=2330
+        hhmm optional — when omitted picks the latest available file.
+    """
+    out = {"steps": []}
+    def step(name, **kw):
+        out["steps"].append({"step": name, **kw})
+
+    try:
+        lat = float(request.args.get("lat", "32.0091"))
+        lon = float(request.args.get("lon", "-97.1303"))
+        date = dt.datetime.strptime(request.args.get("date", "2024-04-23"), "%Y-%m-%d").date()
+        product = request.args.get("product", "MESH_Max_1440min_00.50")
+        hhmm = request.args.get("hhmm") or None
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"bad args: {e}"}), 400
+
+    out["lat"] = lat
+    out["lon"] = lon
+    out["date"] = date.isoformat()
+    out["product"] = product
+    out["hhmm"] = hhmm
+
+    # 1. Listing
+    src, candidates = list_keys(product, date)
+    step("list_keys", source=src, count=len(candidates),
+         first=candidates[0] if candidates else None,
+         last=candidates[-1] if candidates else None)
+    if not candidates:
+        return jsonify(out)
+
+    # 2. Pick file
+    if hhmm:
+        target_min = int(hhmm[0:2]) * 60 + int(hhmm[2:4])
+        chosen_ts, chosen_url = min(candidates, key=lambda c: abs(_hhmmss_to_minutes(c[0]) - target_min))
+    else:
+        chosen_ts, chosen_url = candidates[-1]
+    step("pick_file", chosen_ts=chosen_ts, chosen_url=chosen_url)
+
+    # 3. Download
+    try:
+        r = requests.get(chosen_url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS)
+        step("download", status=r.status_code, gz_bytes=len(r.content) if r.content else 0)
+        if r.status_code != 200 or not r.content:
+            return jsonify(out)
+    except Exception as e:
+        step("download", error=f"{type(e).__name__}: {e}")
+        return jsonify(out)
+
+    # 4. Gunzip
+    try:
+        raw = gzip.decompress(r.content)
+        step("gunzip", grib_bytes=len(raw))
+    except Exception as e:
+        step("gunzip", error=f"{type(e).__name__}: {e}")
+        return jsonify(out)
+
+    # 5. Write to disk
+    local = grib_local_path(product, date, chosen_ts)
+    try:
+        _ensure_dirs()
+        with open(local, "wb") as f:
+            f.write(raw)
+        step("write_disk", path=local, bytes_on_disk=os.path.getsize(local))
+    except Exception as e:
+        step("write_disk", error=f"{type(e).__name__}: {e}")
+        return jsonify(out)
+
+    # 6. eccodes extract
+    if eccodes is None:
+        step("eccodes", error=f"eccodes not loaded: {_ECCODES_IMPORT_ERROR}")
+        return jsonify(out)
+    try:
+        with open(local, "rb") as f:
+            gid = eccodes.codes_grib_new_from_file(f)
+            if gid is None:
+                step("eccodes", error="codes_grib_new_from_file returned None")
+                return jsonify(out)
+            try:
+                nearest = eccodes.codes_grib_find_nearest(gid, lat, lon)
+                # Pull a few attributes for diagnostics
+                try:
+                    short = eccodes.codes_get(gid, "shortName")
+                except Exception:
+                    short = None
+            finally:
+                eccodes.codes_release(gid)
+        if not nearest:
+            step("eccodes", short_name=short, error="find_nearest returned empty")
+            return jsonify(out)
+        n0 = nearest[0]
+        step("eccodes",
+             short_name=short,
+             nearest_lat=n0.get("lat"),
+             nearest_lon=n0.get("lon"),
+             nearest_distance=n0.get("distance"),
+             value=n0.get("value"))
+    except Exception as e:
+        step("eccodes", error=f"{type(e).__name__}: {e}")
+
+    return jsonify(out)
+
+
 @app.route("/api/probe-url")
 def probe_url():
     """Diagnostic: do a raw GET against an arbitrary URL from inside the
