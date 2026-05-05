@@ -37,6 +37,7 @@ import gzip
 import json
 import logging
 import os
+import re
 import sqlite3
 from contextlib import closing
 
@@ -186,82 +187,111 @@ def grib_local_path(product_dir, date, hhmmss=None):
     )
 
 
-def _candidate_urls(product_dir, date, ts):
-    """All URL variations we'll try for a (product, date, timestamp).
+def aws_list_keys(product_dir, date):
+    """Enumerate MRMS files in noaa-mrms-pds for a product+date via S3 ListObjectsV2.
 
-    AWS uses the full product name (with resolution suffix) as the directory.
-    Iowa State's mtarchive uses the bare product name (without _00.50) as the
-    directory but keeps the suffix in the filename. Some products on Iowa
-    State also use the full name as the directory, so we try both."""
+    Returns a list of (hhmmss_str, full_url) sorted ascending by timestamp.
+    MRMS publishes at irregular ~2-minute intervals; rather than guessing
+    exact filenames, we list the bucket and pick the file whose valid time
+    is closest to our target sample window.
+    """
     yyyymmdd = date.strftime("%Y%m%d")
-    yyyy, mm, dd = date.strftime("%Y"), date.strftime("%m"), date.strftime("%d")
-    # "MESH_Max_1440min_00.50" → "MESH_Max_1440min"
-    short_dir = product_dir.rsplit("_00.", 1)[0]
-    return [
-        ("AWS",
-         f"https://noaa-mrms-pds.s3.amazonaws.com/CONUS/{product_dir}/{yyyymmdd}/MRMS_{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
-        ("Iowa State",
-         f"https://mtarchive.geol.iastate.edu/{yyyy}/{mm}/{dd}/mrms/ncep/{short_dir}/{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
-        ("Iowa State (alt)",
-         f"https://mtarchive.geol.iastate.edu/{yyyy}/{mm}/{dd}/mrms/ncep/{product_dir}/{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
-    ]
-
-
-def _fetch_grib(product_dir, date, ts_attempts):
-    """Try AWS, then Iowa State (both directory conventions). Try each
-    timestamp in ts_attempts in order. Returns (local_path, source_name,
-    hhmmss_used) or (None, None, None)."""
-    attempts = []
-    for ts in ts_attempts:
-        local = grib_local_path(product_dir, date, ts)
-        if os.path.exists(local):
-            return local, "cache", ts
-        for source_name, url in _candidate_urls(product_dir, date, ts):
-            try:
-                r = requests.get(url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS,
-                                 allow_redirects=True)
-                if r.status_code == 200 and r.content:
-                    LOG.info(f"fetched {product_dir} from {source_name}: {url} ({len(r.content)} bytes)")
-                    raw = gzip.decompress(r.content)
-                    _ensure_dirs()
-                    with open(local, "wb") as f:
-                        f.write(raw)
-                    return local, source_name, ts
-                attempts.append(f"{source_name} {r.status_code}")
-                # INFO-level so it shows in Railway default logs while we diagnose
-                LOG.info(f"  {url} -> HTTP {r.status_code}")
-            except requests.RequestException as e:
-                attempts.append(f"{source_name} EXC {type(e).__name__}")
-                LOG.info(f"  {url} -> {type(e).__name__}: {e}")
+    list_url = (
+        f"https://noaa-mrms-pds.s3.amazonaws.com/"
+        f"?list-type=2&prefix=CONUS/{product_dir}/{yyyymmdd}/&max-keys=1000"
+    )
+    try:
+        r = requests.get(list_url, timeout=15, headers=HTTP_HEADERS)
+        if r.status_code != 200:
+            LOG.info(f"AWS list returned {r.status_code} for {product_dir}/{yyyymmdd}")
+            return []
+        keys = re.findall(r"<Key>([^<]+)</Key>", r.text)
+        results = []
+        for k in keys:
+            if not k.endswith(".grib2.gz"):
                 continue
-    LOG.warning(f"no source had {product_dir} for {date.isoformat()} — attempts: {attempts}")
+            m = re.search(r"-(\d{8})-(\d{6})\.grib2\.gz$", k)
+            if not m:
+                continue
+            results.append((m.group(2), f"https://noaa-mrms-pds.s3.amazonaws.com/{k}"))
+        results.sort()  # ascending by hhmmss
+        return results
+    except requests.RequestException as e:
+        LOG.info(f"AWS list exception for {product_dir}/{yyyymmdd}: {type(e).__name__}: {e}")
+        return []
+
+
+def _hhmmss_to_minutes(ts):
+    """Convert HHMMSS string to minutes since midnight (ignoring seconds)."""
+    return int(ts[0:2]) * 60 + int(ts[2:4])
+
+
+def _fetch_grib(product_dir, date, target_hhmm=None, max_distance_min=30):
+    """Robust fetch via S3 listing. Picks the published file whose valid time
+    is closest to target_hhmm (4-digit, e.g. '1800'); if target_hhmm is None,
+    picks the latest available file (used for daily summary products).
+
+    Returns (local_path, source_name, hhmmss_used) or (None, None, None).
+    """
+    candidates = aws_list_keys(product_dir, date)
+    if not candidates:
+        LOG.warning(f"no AWS keys listed for {product_dir} on {date.isoformat()}")
+        return None, None, None
+
+    if target_hhmm is None:
+        chosen_ts, chosen_url = candidates[-1]  # latest
+    else:
+        target_min = int(target_hhmm[0:2]) * 60 + int(target_hhmm[2:4])
+        chosen_ts, chosen_url = min(
+            candidates,
+            key=lambda c: abs(_hhmmss_to_minutes(c[0]) - target_min),
+        )
+        actual_min = _hhmmss_to_minutes(chosen_ts)
+        if abs(actual_min - target_min) > max_distance_min:
+            LOG.info(
+                f"closest {product_dir} file ({chosen_ts}) is "
+                f"{abs(actual_min - target_min)} min from target {target_hhmm} — skipping"
+            )
+            return None, None, None
+
+    local = grib_local_path(product_dir, date, chosen_ts)
+    if os.path.exists(local):
+        return local, "AWS (cache)", chosen_ts
+
+    try:
+        r = requests.get(chosen_url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS)
+        if r.status_code == 200 and r.content:
+            LOG.info(f"fetched {product_dir} @ {chosen_ts}: {len(r.content)} bytes")
+            raw = gzip.decompress(r.content)
+            _ensure_dirs()
+            with open(local, "wb") as f:
+                f.write(raw)
+            return local, "AWS", chosen_ts
+        LOG.info(f"  {chosen_url} -> HTTP {r.status_code}")
+    except requests.RequestException as e:
+        LOG.info(f"  {chosen_url} -> {type(e).__name__}: {e}")
     return None, None, None
 
 
-# Daily 24h MESH max — preserved as a thin wrapper for backward compat.
+# Daily 24h MESH max — picks the latest published file for the date.
 def fetch_mesh_24h_grib(date):
+    return _fetch_grib("MESH_Max_1440min_00.50", date, target_hhmm=None)
+
+
+# 6-hour MESH max valid near HH:MM UTC.
+def fetch_mesh_360min_grib(date, hour, minute):
     return _fetch_grib(
-        "MESH_Max_1440min_00.50",
-        date,
-        ["235800", "230000", "225800", "220000", "120000"],
+        "MESH_Max_360min_00.50", date,
+        target_hhmm=f"{hour:02d}{minute:02d}",
     )
 
 
-# 6-hour MESH max ending at the requested HH:MM UTC.
-def fetch_mesh_360min_grib(date, hour, minute):
-    """Try a small window of timestamps around the target HH:MM."""
-    base = hour * 100 + minute
-    candidates = [base, base - 2, base - 4, base - 6, base + 2]
-    ts_attempts = [f"{c // 100:02d}{c % 100:02d}00" for c in candidates if 0 <= c <= 2358]
-    return _fetch_grib("MESH_Max_360min_00.50", date, ts_attempts)
-
-
-# Instantaneous POSH near a specific UTC time.
+# Instantaneous POSH near HH:MM UTC.
 def fetch_posh_grib(date, hour, minute):
-    base = hour * 100 + minute
-    candidates = [base, base - 2, base + 2, base - 4, base + 4]
-    ts_attempts = [f"{c // 100:02d}{c % 100:02d}00" for c in candidates if 0 <= c <= 2358]
-    return _fetch_grib("POSH_00.50", date, ts_attempts)
+    return _fetch_grib(
+        "POSH_00.50", date,
+        target_hhmm=f"{hour:02d}{minute:02d}",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -502,9 +532,10 @@ def event_detail():
 
 @app.route("/api/probe")
 def probe():
-    """Diagnostic: try a fetch for each product and return what URLs we tried
-    and what the responses were. Hits the network but does NOT cache or parse —
-    just confirms whether the archives reply with 200 vs 403 vs 404 vs timeout.
+    """Diagnostic: list what's available for each MRMS product on a given date
+    via the AWS S3 ListObjectsV2 API. Returns the count + first/last timestamps
+    + a few sample timestamps. Useful for confirming product naming + archive
+    coverage without downloading any GRIB data.
 
     Usage:
         /api/probe?date=YYYY-MM-DD
@@ -515,29 +546,27 @@ def probe():
     except (TypeError, ValueError):
         return jsonify({"error": "Use date=YYYY-MM-DD."}), 400
 
-    products_to_probe = [
-        ("MESH_Max_1440min_00.50", "235800"),
-        ("MESH_Max_360min_00.50", "180000"),
-        ("POSH_00.50", "180000"),
+    products = [
+        "MESH_Max_1440min_00.50",
+        "MESH_Max_360min_00.50",
+        "MESH_Max_60min_00.50",
+        "POSH_00.50",
+        "MESH_00.50",
     ]
     results = []
-    for product_dir, ts in products_to_probe:
-        urls = _candidate_urls(product_dir, date, ts)
-        per_url = []
-        for source_name, url in urls:
-            try:
-                r = requests.get(url, timeout=15, headers=HTTP_HEADERS,
-                                 allow_redirects=True, stream=True)
-                # Don't download the body — we only want status
-                size_hint = r.headers.get("content-length")
-                r.close()
-                per_url.append({"source": source_name, "url": url,
-                                "status": r.status_code, "size": size_hint})
-            except requests.RequestException as e:
-                per_url.append({"source": source_name, "url": url,
-                                "status": None, "error": f"{type(e).__name__}: {e}"})
-        results.append({"product": product_dir, "timestamp": ts, "attempts": per_url})
-
+    for p in products:
+        keys = aws_list_keys(p, date)
+        if keys:
+            timestamps = [k[0] for k in keys]
+            results.append({
+                "product": p,
+                "count": len(keys),
+                "first_ts": timestamps[0],
+                "last_ts":  timestamps[-1],
+                "samples":  timestamps[::max(1, len(timestamps) // 5)][:5],
+            })
+        else:
+            results.append({"product": p, "count": 0})
     return jsonify({"date": date.isoformat(), "results": results})
 
 
