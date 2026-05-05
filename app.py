@@ -1,39 +1,43 @@
-"""MESH point-query service.
+"""MRMS forensic point-query service.
 
-Endpoint:
-    GET /api/mesh?lat=<float>&lon=<float>&date=<YYYY-MM-DD>
+Endpoints:
+    GET /api/mesh?lat=&lon=&date=YYYY-MM-DD
+        Backward-compat single-value MESH 24h max lookup.
 
-Returns JSON:
-    {
-        "mesh_in": <float|null>,    # Maximum estimated hail size in inches at the point
-        "source": <str|null>,       # "AWS" / "Iowa State" / "cache" / null when no data
-        "lat_q": <float>,           # Quantized cache lat
-        "lon_q": <float>,           # Quantized cache lon
-        "note": <str|null>,
-    }
+    GET /api/event-detail?lat=&lon=&date=YYYY-MM-DD
+        Multi-signal forensic detail. Returns:
+            {
+                "lat_q": <float>, "lon_q": <float>, "date": <YYYY-MM-DD>,
+                "mesh": {
+                    "max_in":          <float|null>,   # 24h max (MESH_Max_1440min)
+                    "peak_in":         <float|null>,   # max over sampled 60-min windows
+                    "peak_window_utc": <"HH:MM-HH:MM"|null>,
+                    "source":          <str|null>,
+                },
+                "posh": {
+                    "max_pct":         <int|null>,     # 0..100
+                    "peak_window_utc": <"HH:MM-HH:MM"|null>,
+                    "source":          <str|null>,
+                },
+                "samples":  <list of (window_utc, mesh_in, posh_pct)>,
+                "note":     <str|null>,
+            }
 
-Data flow:
-    1. Round (lat, lon) to 0.01 degrees (~0.7 mi) for cache key.
-    2. Look up SQLite cache. Hit → return.
-    3. Miss → fetch MESH_Max_1440min GRIB2 for that date from AWS S3
-       (noaa-mrms-pds, recent dates only) or fall back to Iowa State mtarchive
-       (historical, ~2014+).
-    4. Use eccodes to find the nearest grid value at (lat, lon).
-    5. Convert mm -> inches.  Cache.  Return.
+Data sources:
+    AWS noaa-mrms-pds S3 (recent dates) → Iowa State mtarchive (historical).
 
-Notes:
-    - MRMS MESH "Max_1440min" is a running 24-hour max; we request the file
-      timestamped at the END of the requested UTC day.
-    - Pre-2014 dates have no MESH coverage; we return None.
-    - Future dates rejected.
+Caching:
+    SQLite at /data/mesh_cache.db; one row per (lat_q, lon_q, date).
+    GRIB files cached on disk at /data/grib_cache and reused for additional
+    point lookups within the same date.
 """
 
 import datetime as dt
 import gzip
+import json
 import logging
 import os
 import sqlite3
-import tempfile
 from contextlib import closing
 
 import requests
@@ -43,9 +47,6 @@ from flask_cors import CORS
 try:
     import eccodes
 except Exception as _ecc_err:  # noqa: BLE001
-    # Catch broadly — eccodes can raise RuntimeError/OSError when the C library
-    # can't be located or has an ABI mismatch. We let the container come up
-    # regardless so /health stays reachable; the response advertises the failure.
     eccodes = None
     _ECCODES_IMPORT_ERROR = repr(_ecc_err)
 else:
@@ -60,10 +61,22 @@ logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
 
 DB_PATH = os.environ.get("CACHE_DB", "/data/mesh_cache.db")
 GRIB_CACHE_DIR = os.environ.get("GRIB_CACHE_DIR", "/data/grib_cache")
-MESH_FIRST_DATE = dt.date(2014, 1, 1)  # earliest with reliable MRMS MESH archive
-HTTP_TIMEOUT = 30  # seconds
+MESH_FIRST_DATE = dt.date(2014, 1, 1)
+HTTP_TIMEOUT = 30
 
-# Allowed CORS origins — restrict to our domains.
+# Sub-daily samples. Each tuple: (window_label, valid_hour, valid_minute).
+# MESH_Max_360min is a 6-hour running max — sampling at end of each 6h bin
+# gives non-overlapping full-day coverage with just 4 GRIB fetches per fresh
+# date. Tiny edge effects at the boundaries (e.g. final bin actually covers
+# 17:58→23:58) are inconsequential for forensic timing within ~6h precision.
+SAMPLE_HOURS = [
+    ("00:00-06:00", 6, 0),
+    ("06:00-12:00", 12, 0),
+    ("12:00-18:00", 18, 0),
+    ("18:00-24:00", 23, 58),
+]
+
+# Allowed CORS origins
 ALLOWED_ORIGINS = [
     "https://propertywx.com",
     "https://app.propertywx.com",
@@ -73,15 +86,12 @@ ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
 ]
 
-# -----------------------------------------------------------------------------
-# App + CORS
-# -----------------------------------------------------------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}}, supports_credentials=False)
 
 
 # -----------------------------------------------------------------------------
-# Cache (SQLite)
+# Filesystem
 # -----------------------------------------------------------------------------
 def _ensure_dirs():
     for d in (os.path.dirname(DB_PATH), GRIB_CACHE_DIR):
@@ -92,6 +102,9 @@ def _ensure_dirs():
                 LOG.warning(f"cannot create {d}: {e}")
 
 
+# -----------------------------------------------------------------------------
+# Cache (SQLite)
+# -----------------------------------------------------------------------------
 def _conn():
     _ensure_dirs()
     c = sqlite3.connect(DB_PATH)
@@ -99,6 +112,13 @@ def _conn():
         CREATE TABLE IF NOT EXISTS cache (
             lat_q REAL, lon_q REAL, date TEXT,
             mesh_in REAL, source TEXT, fetched_at TEXT,
+            PRIMARY KEY (lat_q, lon_q, date)
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS detail_cache (
+            lat_q REAL, lon_q REAL, date TEXT,
+            detail_json TEXT, fetched_at TEXT,
             PRIMARY KEY (lat_q, lon_q, date)
         )
     """)
@@ -111,7 +131,7 @@ def cache_get(lat_q, lon_q, date_str):
             "SELECT mesh_in, source FROM cache WHERE lat_q=? AND lon_q=? AND date=?",
             (lat_q, lon_q, date_str),
         ).fetchone()
-    return row  # (mesh_in, source) or None
+    return row
 
 
 def cache_put(lat_q, lon_q, date_str, mesh_in, source):
@@ -123,63 +143,107 @@ def cache_put(lat_q, lon_q, date_str, mesh_in, source):
         c.commit()
 
 
+def detail_cache_get(lat_q, lon_q, date_str):
+    with closing(_conn()) as c:
+        row = c.execute(
+            "SELECT detail_json FROM detail_cache WHERE lat_q=? AND lon_q=? AND date=?",
+            (lat_q, lon_q, date_str),
+        ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        return json.loads(row[0])
+    except json.JSONDecodeError:
+        return None
+
+
+def detail_cache_put(lat_q, lon_q, date_str, detail):
+    with closing(_conn()) as c:
+        c.execute(
+            "INSERT OR REPLACE INTO detail_cache (lat_q, lon_q, date, detail_json, fetched_at) VALUES (?, ?, ?, ?, ?)",
+            (lat_q, lon_q, date_str, json.dumps(detail), dt.datetime.utcnow().isoformat()),
+        )
+        c.commit()
+
+
 # -----------------------------------------------------------------------------
-# GRIB2 fetch
+# Generic MRMS GRIB2 fetch
 # -----------------------------------------------------------------------------
-# Try a sequence of timestamps near end-of-day (1440-min running max — last
-# valid time of the requested UTC day captures everything within that day).
-# If a particular minute is missing on the source, fall back to earlier ones.
-TIMESTAMPS = ["235800", "230000", "225800", "220000", "120000"]
+def grib_local_path(product_dir, date, hhmmss=None):
+    """One file per (product, date, optional timestamp). Sub-daily samples
+    use hhmmss to keep distinct files; daily products omit it."""
+    suffix = f"_{hhmmss}" if hhmmss else ""
+    return os.path.join(
+        GRIB_CACHE_DIR,
+        f"{product_dir}_{date.strftime('%Y%m%d')}{suffix}.grib2",
+    )
 
 
-def grib_local_path(date):
-    return os.path.join(GRIB_CACHE_DIR, f"MESH_{date.strftime('%Y%m%d')}.grib2")
-
-
-def fetch_mesh_grib(date):
-    """Download MESH_Max_1440min GRIB2 for the given UTC date.
-
-    Returns (path_to_grib_file, source_name) or (None, None).
-    Caches the decompressed GRIB2 to disk so multiple lat/lon lookups for the
-    same date hit the local copy.
-    """
-    local = grib_local_path(date)
-    if os.path.exists(local):
-        return local, "cache"
-
+def _fetch_grib(product_dir, date, ts_attempts):
+    """Try AWS, then Iowa State. Try each timestamp in ts_attempts in order.
+    Returns (local_path, source_name, hhmmss_used) or (None, None, None)."""
     yyyymmdd = date.strftime("%Y%m%d")
     yyyy, mm, dd = date.strftime("%Y"), date.strftime("%m"), date.strftime("%d")
 
     sources = [
         ("AWS",
-         lambda ts: f"https://noaa-mrms-pds.s3.amazonaws.com/CONUS/MESH_Max_1440min_00.50/{yyyymmdd}/MRMS_MESH_Max_1440min_00.50_{yyyymmdd}-{ts}.grib2.gz"),
+         lambda ts: f"https://noaa-mrms-pds.s3.amazonaws.com/CONUS/{product_dir}/{yyyymmdd}/MRMS_{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
         ("Iowa State",
-         lambda ts: f"https://mtarchive.geol.iastate.edu/{yyyy}/{mm}/{dd}/mrms/ncep/MESH_Max_1440min/MESH_Max_1440min_00.50_{yyyymmdd}-{ts}.grib2.gz"),
+         lambda ts: f"https://mtarchive.geol.iastate.edu/{yyyy}/{mm}/{dd}/mrms/ncep/{product_dir}/{product_dir}_{yyyymmdd}-{ts}.grib2.gz"),
     ]
     for source_name, url_fn in sources:
-        for ts in TIMESTAMPS:
+        for ts in ts_attempts:
+            local = grib_local_path(product_dir, date, ts)
+            if os.path.exists(local):
+                return local, "cache", ts
             url = url_fn(ts)
             try:
                 r = requests.get(url, timeout=HTTP_TIMEOUT)
                 if r.status_code == 200 and r.content:
-                    LOG.info(f"fetched MESH from {source_name}: {url} ({len(r.content)} bytes)")
+                    LOG.info(f"fetched {product_dir} from {source_name}: {url} ({len(r.content)} bytes)")
                     raw = gzip.decompress(r.content)
                     _ensure_dirs()
                     with open(local, "wb") as f:
                         f.write(raw)
-                    return local, source_name
+                    return local, source_name, ts
                 LOG.debug(f"  {url} -> HTTP {r.status_code}")
             except requests.RequestException as e:
                 LOG.debug(f"  {url} -> {e}")
                 continue
-    return None, None
+    return None, None, None
+
+
+# Daily 24h MESH max — preserved as a thin wrapper for backward compat.
+def fetch_mesh_24h_grib(date):
+    return _fetch_grib(
+        "MESH_Max_1440min_00.50",
+        date,
+        ["235800", "230000", "225800", "220000", "120000"],
+    )
+
+
+# 6-hour MESH max ending at the requested HH:MM UTC.
+def fetch_mesh_360min_grib(date, hour, minute):
+    """Try a small window of timestamps around the target HH:MM."""
+    base = hour * 100 + minute
+    candidates = [base, base - 2, base - 4, base - 6, base + 2]
+    ts_attempts = [f"{c // 100:02d}{c % 100:02d}00" for c in candidates if 0 <= c <= 2358]
+    return _fetch_grib("MESH_Max_360min_00.50", date, ts_attempts)
+
+
+# Instantaneous POSH near a specific UTC time.
+def fetch_posh_grib(date, hour, minute):
+    base = hour * 100 + minute
+    candidates = [base, base - 2, base + 2, base - 4, base + 4]
+    ts_attempts = [f"{c // 100:02d}{c % 100:02d}00" for c in candidates if 0 <= c <= 2358]
+    return _fetch_grib("POSH_00.50", date, ts_attempts)
 
 
 # -----------------------------------------------------------------------------
 # Point extraction (eccodes)
 # -----------------------------------------------------------------------------
 def extract_value(grib_path, lat, lon):
-    """Return MRMS MESH value (in mm) at the nearest grid cell, or None."""
+    """Return raw MRMS value at the nearest grid cell, or None."""
     if eccodes is None:
         raise RuntimeError("eccodes Python bindings not installed")
     with open(grib_path, "rb") as f:
@@ -192,19 +256,101 @@ def extract_value(grib_path, lat, lon):
             eccodes.codes_release(gid)
     if not nearest:
         return None
-    # find_nearest returns a list of dicts; default 1 nearest
     val = nearest[0]["value"]
-    # MRMS uses -3 (or sometimes -999) for missing/out-of-coverage
     if val is None or val < 0:
         return None
     return float(val)
 
 
 # -----------------------------------------------------------------------------
-# Old-grib-file cleanup
+# High-level orchestration
+# -----------------------------------------------------------------------------
+def get_event_detail(lat, lon, date):
+    """Build the full multi-signal forensic record for a (lat, lon, date)."""
+    date_str = date.isoformat()
+
+    # 1) Daily 24h MESH max
+    mesh_max_in = None
+    mesh_source = None
+    grib_path, src, _ = fetch_mesh_24h_grib(date)
+    if grib_path:
+        try:
+            v = extract_value(grib_path, lat, lon)
+            if v is not None:
+                mesh_max_in = round(v / 25.4, 2)
+                mesh_source = src
+        except Exception:
+            LOG.exception("MESH 24h extract failed")
+
+    # 2) Sub-daily MESH samples (6-hour running max, 4 per day)
+    samples = []
+    mesh_peak_in = None
+    mesh_peak_window = None
+    mesh_peak_source = None
+    for label, hour, minute in SAMPLE_HOURS:
+        gp, src, _ = fetch_mesh_360min_grib(date, hour, minute)
+        v_in = None
+        if gp:
+            try:
+                v_mm = extract_value(gp, lat, lon)
+                if v_mm is not None:
+                    v_in = round(v_mm / 25.4, 2)
+            except Exception:
+                LOG.exception(f"MESH 360min extract failed @ {label}")
+        samples.append({"window_utc": label, "mesh_in": v_in, "posh_pct": None,
+                        "_hour": hour, "_minute": minute, "_source": src})
+        if v_in is not None and (mesh_peak_in is None or v_in > mesh_peak_in):
+            mesh_peak_in = v_in
+            mesh_peak_window = label
+            mesh_peak_source = src
+
+    # 3) POSH samples — instantaneous, taken at end of each MESH window
+    posh_max_pct = None
+    posh_peak_window = None
+    posh_source = None
+    for s in samples:
+        gp, src, _ = fetch_posh_grib(date, s["_hour"], s["_minute"])
+        if gp:
+            try:
+                v = extract_value(gp, lat, lon)
+                if v is not None:
+                    pct = max(0, min(100, int(round(v))))
+                    s["posh_pct"] = pct
+                    if posh_max_pct is None or pct > posh_max_pct:
+                        posh_max_pct = pct
+                        posh_peak_window = s["window_utc"]
+                        posh_source = src
+            except Exception:
+                LOG.exception(f"POSH extract failed @ {s['window_utc']}")
+
+    # Strip private keys before returning
+    public_samples = [{k: v for k, v in s.items() if not k.startswith("_")} for s in samples]
+
+    detail = {
+        "lat_q": round(lat, 2),
+        "lon_q": round(lon, 2),
+        "date": date_str,
+        "mesh": {
+            "max_in": mesh_max_in,
+            "peak_in": mesh_peak_in,
+            "peak_window_utc": mesh_peak_window,
+            "source": mesh_source or mesh_peak_source,
+        },
+        "posh": {
+            "max_pct": posh_max_pct,
+            "peak_window_utc": posh_peak_window,
+            "source": posh_source,
+        },
+        "samples": public_samples,
+        "note": None,
+    }
+    return detail
+
+
+# -----------------------------------------------------------------------------
+# Cleanup
 # -----------------------------------------------------------------------------
 def cleanup_old_grib_files(max_age_days=30):
-    """Delete cached GRIB files older than max_age_days. Runs on each cold start."""
     if not os.path.isdir(GRIB_CACHE_DIR):
         return
     cutoff = dt.datetime.utcnow().timestamp() - (max_age_days * 86400)
@@ -221,29 +367,38 @@ def cleanup_old_grib_files(max_age_days=30):
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
-@app.route("/api/mesh")
-def mesh_lookup():
+def _parse_request_args():
+    """Return (lat, lon, date, error_response_or_None)."""
     try:
         lat = float(request.args.get("lat", ""))
         lon = float(request.args.get("lon", ""))
         date_str = request.args.get("date", "")
         date = dt.datetime.strptime(date_str, "%Y-%m-%d").date()
     except (TypeError, ValueError):
-        return jsonify({"error": "Invalid lat/lon/date. Use lat=<deg>&lon=<deg>&date=YYYY-MM-DD."}), 400
-
+        return None, None, None, (jsonify({"error": "Invalid lat/lon/date. Use lat=<deg>&lon=<deg>&date=YYYY-MM-DD."}), 400)
     if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
-        return jsonify({"error": "Coordinates out of range."}), 400
+        return None, None, None, (jsonify({"error": "Coordinates out of range."}), 400)
+    if date > dt.date.today():
+        return None, None, None, (jsonify({"error": "Future date."}), 400)
+    return lat, lon, date, None
+
+
+@app.route("/api/mesh")
+def mesh_lookup():
+    """Backward-compat: returns just the 24h MESH max for a (lat, lon, date)."""
+    lat, lon, date, err = _parse_request_args()
+    if err:
+        return err
 
     if date < MESH_FIRST_DATE:
         return jsonify({
             "mesh_in": None, "source": None,
             "note": f"MRMS MESH archive begins {MESH_FIRST_DATE.isoformat()}; pre-2014 dates not available.",
         })
-    if date > dt.date.today():
-        return jsonify({"error": "Future date."}), 400
 
     lat_q = round(lat, 2)
     lon_q = round(lon, 2)
+    date_str = date.isoformat()
 
     cached = cache_get(lat_q, lon_q, date_str)
     if cached is not None:
@@ -251,7 +406,7 @@ def mesh_lookup():
         return jsonify({"mesh_in": mesh_in, "source": (source or "no-data") + " (cached)",
                         "lat_q": lat_q, "lon_q": lon_q})
 
-    grib_path, source = fetch_mesh_grib(date)
+    grib_path, source, _ = fetch_mesh_24h_grib(date)
     if not grib_path:
         cache_put(lat_q, lon_q, date_str, None, "no-data")
         return jsonify({"mesh_in": None, "source": None,
@@ -269,6 +424,47 @@ def mesh_lookup():
     return jsonify({"mesh_in": mesh_in, "source": source, "lat_q": lat_q, "lon_q": lon_q})
 
 
+@app.route("/api/event-detail")
+def event_detail():
+    """Multi-signal forensic detail. Pulls daily MESH max + sub-daily MESH +
+    POSH samples and returns a structured record. Caches as JSON."""
+    lat, lon, date, err = _parse_request_args()
+    if err:
+        return err
+
+    if date < MESH_FIRST_DATE:
+        return jsonify({
+            "lat_q": round(lat, 2), "lon_q": round(lon, 2), "date": date.isoformat(),
+            "mesh": {"max_in": None, "peak_in": None, "peak_window_utc": None, "source": None},
+            "posh": {"max_pct": None, "peak_window_utc": None, "source": None},
+            "samples": [],
+            "note": f"MRMS archive begins {MESH_FIRST_DATE.isoformat()}; pre-2014 dates not available.",
+        })
+
+    lat_q = round(lat, 2)
+    lon_q = round(lon, 2)
+    date_str = date.isoformat()
+
+    cached = detail_cache_get(lat_q, lon_q, date_str)
+    if cached is not None:
+        cached_copy = dict(cached)
+        # Annotate that this came from cache without mutating the cached source name
+        m = dict(cached_copy.get("mesh") or {})
+        if m.get("source"):
+            m["source"] = m["source"] + " (cached)"
+        cached_copy["mesh"] = m
+        return jsonify(cached_copy)
+
+    try:
+        detail = get_event_detail(lat, lon, date)
+    except Exception as e:
+        LOG.exception("event-detail orchestration failed")
+        return jsonify({"error": f"Backend error: {e}"}), 500
+
+    detail_cache_put(lat_q, lon_q, date_str, detail)
+    return jsonify(detail)
+
+
 @app.route("/health")
 def health():
     return jsonify({
@@ -283,10 +479,11 @@ def health():
 @app.route("/")
 def root():
     return jsonify({
-        "service": "PropertyWX MESH lookup",
+        "service": "PropertyWX MRMS forensic lookup",
         "endpoints": {
-            "GET /api/mesh": "params: lat, lon, date (YYYY-MM-DD); returns mesh_in + source",
-            "GET /health": "service status",
+            "GET /api/mesh":         "params: lat, lon, date (YYYY-MM-DD); returns mesh_in (24h max) + source",
+            "GET /api/event-detail": "params: lat, lon, date; returns full multi-signal record (mesh max + peak hour + posh)",
+            "GET /health":           "service status",
         },
     })
 
@@ -294,9 +491,8 @@ def root():
 try:
     cleanup_old_grib_files()
 except Exception as _cleanup_err:  # noqa: BLE001
-    # Don't let a transient FS issue (volume not yet mounted, perms, etc.)
-    # prevent the container from booting.
     LOG.warning(f"cleanup_old_grib_files skipped: {_cleanup_err!r}")
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8000")), debug=False)
