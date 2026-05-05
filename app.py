@@ -191,9 +191,8 @@ def aws_list_keys(product_dir, date):
     """Enumerate MRMS files in noaa-mrms-pds for a product+date via S3 ListObjectsV2.
 
     Returns a list of (hhmmss_str, full_url) sorted ascending by timestamp.
-    MRMS publishes at irregular ~2-minute intervals; rather than guessing
-    exact filenames, we list the bucket and pick the file whose valid time
-    is closest to our target sample window.
+    The PDS bucket retains roughly the most recent ~24-72 hours, so this will
+    return [] for older dates — Iowa State is the archive fallback.
     """
     yyyymmdd = date.strftime("%Y%m%d")
     list_url = (
@@ -221,21 +220,87 @@ def aws_list_keys(product_dir, date):
         return []
 
 
+def iastate_list_keys(product_dir, date):
+    """Enumerate MRMS files in the Iowa State Mesonet mtarchive for a
+    product+date by parsing the Apache directory index.
+
+    Iowa State preserves MRMS data going back several years — this is the
+    archive fallback when AWS noaa-mrms-pds is empty (older than ~3 days).
+
+    Naming gotcha: the *directory* name on Iowa State drops the `_00.50`
+    height suffix, but the *file* name keeps it.
+        AWS dir:    CONUS/MESH_Max_360min_00.50/20240423/
+        IAState dir: 2024/04/23/mrms/ncep/MESH_Max_360min/
+        Both files: MRMS_MESH_Max_360min_00.50_20240423-180000.grib2.gz
+
+    Returns a list of (hhmmss_str, full_url) sorted ascending.
+    """
+    # Strip the height-level suffix for the directory portion of the URL.
+    # Heights in MRMS file names are written as `_<HH.HH>` (e.g. `_00.50`).
+    ia_dir = re.sub(r"_\d{2}\.\d{2}$", "", product_dir)
+
+    yyyy = date.strftime("%Y")
+    mm = date.strftime("%m")
+    dd = date.strftime("%d")
+    base_url = (
+        f"https://mtarchive.geol.iastate.edu/"
+        f"{yyyy}/{mm}/{dd}/mrms/ncep/{ia_dir}/"
+    )
+    try:
+        r = requests.get(base_url, timeout=20, headers=HTTP_HEADERS)
+        if r.status_code != 200:
+            LOG.info(f"IAState list returned {r.status_code} for {ia_dir} {yyyy}/{mm}/{dd}")
+            return []
+        # Apache index lists files as <a href="MRMS_..._YYYYMMDD-HHMMSS.grib2.gz">
+        hrefs = re.findall(r'href="([^"?][^"]*\.grib2\.gz)"', r.text)
+        yyyymmdd = date.strftime("%Y%m%d")
+        results = []
+        for h in hrefs:
+            m = re.search(rf"-{yyyymmdd}-(\d{{6}})\.grib2\.gz$", h)
+            if not m:
+                continue
+            results.append((m.group(1), base_url + h))
+        results.sort()
+        return results
+    except requests.RequestException as e:
+        LOG.info(f"IAState list exception for {ia_dir} {yyyy}/{mm}/{dd}: {type(e).__name__}: {e}")
+        return []
+
+
+def list_keys(product_dir, date):
+    """Unified MRMS file listing. Tries AWS noaa-mrms-pds first (fast, but
+    only the last ~3 days). Falls back to Iowa State mtarchive for the deep
+    historical archive.
+
+    Returns (sources, candidates) where sources is "AWS" / "IAState" / None
+    and candidates is the (hhmmss, url) list (possibly empty).
+    """
+    aws = aws_list_keys(product_dir, date)
+    if aws:
+        return "AWS", aws
+    ia = iastate_list_keys(product_dir, date)
+    if ia:
+        return "IAState", ia
+    return None, []
+
+
 def _hhmmss_to_minutes(ts):
     """Convert HHMMSS string to minutes since midnight (ignoring seconds)."""
     return int(ts[0:2]) * 60 + int(ts[2:4])
 
 
 def _fetch_grib(product_dir, date, target_hhmm=None, max_distance_min=30):
-    """Robust fetch via S3 listing. Picks the published file whose valid time
-    is closest to target_hhmm (4-digit, e.g. '1800'); if target_hhmm is None,
-    picks the latest available file (used for daily summary products).
+    """Robust fetch via directory listing. Picks the published file whose
+    valid time is closest to target_hhmm (4-digit, e.g. '1800'); if target_hhmm
+    is None, picks the latest available file (used for daily summary products).
+
+    Tries AWS first, falls back to Iowa State for archives.
 
     Returns (local_path, source_name, hhmmss_used) or (None, None, None).
     """
-    candidates = aws_list_keys(product_dir, date)
+    src_name, candidates = list_keys(product_dir, date)
     if not candidates:
-        LOG.warning(f"no AWS keys listed for {product_dir} on {date.isoformat()}")
+        LOG.warning(f"no keys listed (AWS or IAState) for {product_dir} on {date.isoformat()}")
         return None, None, None
 
     if target_hhmm is None:
@@ -256,17 +321,17 @@ def _fetch_grib(product_dir, date, target_hhmm=None, max_distance_min=30):
 
     local = grib_local_path(product_dir, date, chosen_ts)
     if os.path.exists(local):
-        return local, "AWS (cache)", chosen_ts
+        return local, f"{src_name} (cache)", chosen_ts
 
     try:
         r = requests.get(chosen_url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS)
         if r.status_code == 200 and r.content:
-            LOG.info(f"fetched {product_dir} @ {chosen_ts}: {len(r.content)} bytes")
+            LOG.info(f"fetched {product_dir} @ {chosen_ts} from {src_name}: {len(r.content)} bytes")
             raw = gzip.decompress(r.content)
             _ensure_dirs()
             with open(local, "wb") as f:
                 f.write(raw)
-            return local, "AWS", chosen_ts
+            return local, src_name, chosen_ts
         LOG.info(f"  {chosen_url} -> HTTP {r.status_code}")
     except requests.RequestException as e:
         LOG.info(f"  {chosen_url} -> {type(e).__name__}: {e}")
@@ -555,18 +620,22 @@ def probe():
     ]
     results = []
     for p in products:
-        keys = aws_list_keys(p, date)
+        aws_keys = aws_list_keys(p, date)
+        ia_keys = iastate_list_keys(p, date) if not aws_keys else []
+        keys = aws_keys or ia_keys
+        used = "AWS" if aws_keys else ("IAState" if ia_keys else None)
         if keys:
             timestamps = [k[0] for k in keys]
             results.append({
                 "product": p,
-                "count": len(keys),
+                "source":  used,
+                "count":   len(keys),
                 "first_ts": timestamps[0],
                 "last_ts":  timestamps[-1],
                 "samples":  timestamps[::max(1, len(timestamps) // 5)][:5],
             })
         else:
-            results.append({"product": p, "count": 0})
+            results.append({"product": p, "source": None, "count": 0})
     return jsonify({"date": date.isoformat(), "results": results})
 
 
