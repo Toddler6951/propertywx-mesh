@@ -64,6 +64,13 @@ GRIB_CACHE_DIR = os.environ.get("GRIB_CACHE_DIR", "/data/grib_cache")
 MESH_FIRST_DATE = dt.date(2014, 1, 1)
 HTTP_TIMEOUT = 30
 
+# Some archive hosts (Iowa State mtarchive in particular) reject the default
+# python-requests User-Agent. Identify ourselves like a normal client.
+HTTP_HEADERS = {
+    "User-Agent": "PropertyWX/1.0 (+https://propertywx.com)",
+    "Accept": "*/*",
+}
+
 # Sub-daily samples. Each tuple: (window_label, valid_hour, valid_minute).
 # MESH_Max_360min is a 6-hour running max — sampling at end of each 6h bin
 # gives non-overlapping full-day coverage with just 4 GRIB fetches per fresh
@@ -204,14 +211,15 @@ def _fetch_grib(product_dir, date, ts_attempts):
     """Try AWS, then Iowa State (both directory conventions). Try each
     timestamp in ts_attempts in order. Returns (local_path, source_name,
     hhmmss_used) or (None, None, None)."""
-    last_status = None
+    attempts = []
     for ts in ts_attempts:
         local = grib_local_path(product_dir, date, ts)
         if os.path.exists(local):
             return local, "cache", ts
         for source_name, url in _candidate_urls(product_dir, date, ts):
             try:
-                r = requests.get(url, timeout=HTTP_TIMEOUT)
+                r = requests.get(url, timeout=HTTP_TIMEOUT, headers=HTTP_HEADERS,
+                                 allow_redirects=True)
                 if r.status_code == 200 and r.content:
                     LOG.info(f"fetched {product_dir} from {source_name}: {url} ({len(r.content)} bytes)")
                     raw = gzip.decompress(r.content)
@@ -219,13 +227,14 @@ def _fetch_grib(product_dir, date, ts_attempts):
                     with open(local, "wb") as f:
                         f.write(raw)
                     return local, source_name, ts
-                last_status = f"{source_name} {r.status_code}"
-                LOG.debug(f"  {url} -> HTTP {r.status_code}")
+                attempts.append(f"{source_name} {r.status_code}")
+                # INFO-level so it shows in Railway default logs while we diagnose
+                LOG.info(f"  {url} -> HTTP {r.status_code}")
             except requests.RequestException as e:
-                last_status = f"{source_name} EXC {type(e).__name__}"
-                LOG.debug(f"  {url} -> {e}")
+                attempts.append(f"{source_name} EXC {type(e).__name__}")
+                LOG.info(f"  {url} -> {type(e).__name__}: {e}")
                 continue
-    LOG.warning(f"no source had {product_dir} for {date.isoformat()} (last: {last_status})")
+    LOG.warning(f"no source had {product_dir} for {date.isoformat()} — attempts: {attempts}")
     return None, None, None
 
 
